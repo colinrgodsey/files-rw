@@ -25,6 +25,34 @@ func isBinary(data []byte) bool {
 // MaxReadSizeBytes is the maximum allowed byte size for a single read operation (200KB).
 const MaxReadSizeBytes = 200 * 1024
 
+// MaxCatSizeBytes is the maximum allowed byte size for a single cat operation (30MB).
+const MaxCatSizeBytes = 30 * 1024 * 1024
+
+// CatFile opens path via acc.OpenFile and streams its raw bytes directly to w.
+// Bypasses the text/isBinary check entirely. Enforces a 30MB size limit via
+// os.Stat check before streaming.
+func CatFile(acc *Access, path, cwd string, w io.Writer) error {
+	f, canonPath, err := acc.OpenFile(path, cwd, false, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat %s: %w", canonPath, err)
+	}
+
+	if st.Size() > MaxCatSizeBytes {
+		return fmt.Errorf("%s size is %d bytes, which exceeds the %d byte cat limit", canonPath, st.Size(), MaxCatSizeBytes)
+	}
+
+	if _, err := io.Copy(w, f); err != nil {
+		return fmt.Errorf("failed to stream %s: %w", canonPath, err)
+	}
+	return nil
+}
+
 // ReadFile opens path via acc.OpenFile and returns its content, optionally restricted to the inclusive
 // 1-indexed [start, end] line range. If numbered is true, output is cat -n
 // formatted ("%6d\t%s\n"). If false, raw text is returned. If output exceeds

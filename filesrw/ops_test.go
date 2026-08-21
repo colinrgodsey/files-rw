@@ -98,6 +98,58 @@ func TestReadFile(t *testing.T) {
 	}
 }
 
+func TestCatFile(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+
+	// 1. Cat binary file (must succeed, bypassing isBinary)
+	binPath := filepath.Join(tempDir, "sample.bin")
+	binContent := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 1, 2, 3}
+	if err := os.WriteFile(binPath, binContent, 0o600); err != nil {
+		t.Fatalf("failed to write binary file: %v", err)
+	}
+
+	var buf strings.Builder
+	if err := CatFile(acc, "sample.bin", tempDir, &buf); err != nil {
+		t.Fatalf("CatFile on binary file failed: %v", err)
+	}
+	if buf.String() != string(binContent) {
+		t.Errorf("got %q, expected %q", buf.String(), string(binContent))
+	}
+
+	// 2. Cat text file
+	txtPath := filepath.Join(tempDir, "hello.txt")
+	if err := os.WriteFile(txtPath, []byte("hello world"), 0o600); err != nil {
+		t.Fatalf("failed to write text file: %v", err)
+	}
+	buf.Reset()
+	if err := CatFile(acc, "hello.txt", tempDir, &buf); err != nil {
+		t.Fatalf("CatFile on text file failed: %v", err)
+	}
+	if buf.String() != "hello world" {
+		t.Errorf("got %q, expected %q", buf.String(), "hello world")
+	}
+
+	// 3. Cat rejects file exceeding 30MB limit
+	// (Create a sparse or stat-checked mock file or test the limit check)
+	hugePath := filepath.Join(tempDir, "huge.bin")
+	hugeFile, err := os.Create(hugePath)
+	if err != nil {
+		t.Fatalf("failed to create huge file: %v", err)
+	}
+	// Truncate to 31MB without writing 31MB to disk
+	if err := hugeFile.Truncate(int64(MaxCatSizeBytes + 1024)); err != nil {
+		_ = hugeFile.Close()
+		t.Fatalf("failed to truncate huge file: %v", err)
+	}
+	_ = hugeFile.Close()
+
+	buf.Reset()
+	err = CatFile(acc, "huge.bin", tempDir, &buf)
+	if err == nil || !strings.Contains(err.Error(), "exceeds the 31457280 byte cat limit") {
+		t.Fatalf("expected cat limit error, got: %v", err)
+	}
+}
+
 func TestHardlinkReadBypassRejection(t *testing.T) {
 	tempDir, acc := helperSetupAccess(t)
 

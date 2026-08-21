@@ -57,6 +57,24 @@ var readCmd = &cobra.Command{
 	},
 }
 
+var catCmd = &cobra.Command{
+	Use:   "cat <path>",
+	Short: "Stream raw binary or text file to stdout",
+	Long:  "Stream raw binary or text file bytes directly to standard output up to 30MB. Bypasses text/isBinary checks. Intended for piping binary or image data into other tools via stdin.",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("failed to get working directory: %w", err)
+		}
+		access, err := filesrw.LoadAccess(cwd)
+		if err != nil {
+			return err
+		}
+		return filesrw.CatFile(access, args[0], cwd, os.Stdout)
+	},
+}
+
 var writeCmd = &cobra.Command{
 	Use:   "write <path>",
 	Short: "Write content from standard input to a file atomically",
@@ -289,6 +307,7 @@ func init() {
 	listCmd.Flags().BoolVarP(&listRecursive, "recursive", "R", false, "list subdirectories recursively")
 
 	rootCmd.AddCommand(readCmd)
+	rootCmd.AddCommand(catCmd)
 	rootCmd.AddCommand(writeCmd)
 	rootCmd.AddCommand(copyCmd)
 	rootCmd.AddCommand(moveCmd)
