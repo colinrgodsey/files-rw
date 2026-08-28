@@ -22,6 +22,8 @@ var (
 	listLong      bool
 	listAll       bool
 	listRecursive bool
+
+	writeAllowEmpty bool
 )
 
 var rootCmd = &cobra.Command{
@@ -78,7 +80,7 @@ var catCmd = &cobra.Command{
 var writeCmd = &cobra.Command{
 	Use:   "write <path>",
 	Short: "Write content from standard input to a file atomically",
-	Long:  "Write content provided on standard input atomically to the target path, creating any missing parent directories.",
+	Long:  "Write content provided on standard input atomically to the target path, creating any missing parent directories. Refuses empty content by default to prevent accidental truncations; pass --allow-empty to write an empty file intentionally.",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cwd, err := os.Getwd()
@@ -89,9 +91,12 @@ var writeCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		data, err := io.ReadAll(os.Stdin)
+		data, err := io.ReadAll(cmd.InOrStdin())
 		if err != nil {
 			return fmt.Errorf("failed to read content from stdin: %w", err)
+		}
+		if len(data) == 0 && !writeAllowEmpty {
+			return fmt.Errorf("refusing to write empty content to %s - pass --allow-empty to write an empty file intentionally", args[0])
 		}
 		return filesrw.WriteFile(access, args[0], cwd, string(data))
 	},
@@ -186,7 +191,7 @@ var patchCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		diff, err := io.ReadAll(os.Stdin)
+		diff, err := io.ReadAll(cmd.InOrStdin())
 		if err != nil {
 			return fmt.Errorf("failed to read diff from stdin: %w", err)
 		}
@@ -282,7 +287,7 @@ var appendCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		data, err := io.ReadAll(os.Stdin)
+		data, err := io.ReadAll(cmd.InOrStdin())
 		if err != nil {
 			return fmt.Errorf("failed to read content from stdin: %w", err)
 		}
@@ -305,6 +310,8 @@ func init() {
 	listCmd.Flags().BoolVarP(&listLong, "long", "l", false, "use long listing format")
 	listCmd.Flags().BoolVarP(&listAll, "all", "a", false, "do not ignore entries starting with .")
 	listCmd.Flags().BoolVarP(&listRecursive, "recursive", "R", false, "list subdirectories recursively")
+
+	writeCmd.Flags().BoolVar(&writeAllowEmpty, "allow-empty", false, "Allow writing empty (zero-byte) content from stdin")
 
 	rootCmd.AddCommand(readCmd)
 	rootCmd.AddCommand(catCmd)
