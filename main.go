@@ -1,14 +1,23 @@
 package main
 
 import (
+	_ "embed"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/colinrgodsey/files-rw/filesrw"
 )
+
+const (
+	skillNameFilesRW = "files-rw"
+)
+
+//go:embed skills/files-rw/SKILL.md
+var bundledFilesRWSkill string
 
 var (
 	readStart   int
@@ -295,6 +304,111 @@ var appendCmd = &cobra.Command{
 	},
 }
 
+type skillInfo struct {
+	Name        string
+	Description string
+	AlwaysLoad  bool
+}
+
+type bundledSkill struct {
+	ShortName string
+	Skill     *skillInfo
+}
+
+func parseSkillContent(content string, fallbackName string) (*skillInfo, error) {
+	info := &skillInfo{
+		Name: fallbackName,
+	}
+	trimmed := strings.TrimSpace(content)
+	if strings.HasPrefix(trimmed, "---") {
+		parts := strings.SplitN(trimmed[3:], "---", 2)
+		if len(parts) >= 2 {
+			yamlText := parts[0]
+			for _, line := range strings.Split(yamlText, "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" || strings.HasPrefix(line, "#") {
+					continue
+				}
+				kv := strings.SplitN(line, ":", 2)
+				if len(kv) == 2 {
+					k := strings.TrimSpace(kv[0])
+					v := strings.TrimSpace(kv[1])
+					v = strings.Trim(v, `"'`)
+					switch k {
+					case "name":
+						if v != "" {
+							info.Name = v
+						}
+					case "description":
+						if v != "" {
+							info.Description = v
+						}
+					case "always_load":
+						info.AlwaysLoad = (v == "true")
+					}
+				}
+			}
+		}
+	}
+	if info.Name == "" {
+		info.Name = fallbackName
+	}
+	if info.Description == "" {
+		info.Description = fmt.Sprintf("Skill %s", info.Name)
+	}
+	return info, nil
+}
+
+func bundledSkills() ([]bundledSkill, error) {
+	sk, err := parseSkillContent(bundledFilesRWSkill, skillNameFilesRW)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse bundled %s skill: %w", skillNameFilesRW, err)
+	}
+	return []bundledSkill{
+		{ShortName: skillNameFilesRW, Skill: sk},
+	}, nil
+}
+
+func getSkillContent(name string) (string, error) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	switch name {
+	case skillNameFilesRW:
+		return bundledFilesRWSkill, nil
+	default:
+		return "", fmt.Errorf("unknown skill %q. Available skills: %s", name, skillNameFilesRW)
+	}
+}
+
+var skillCmd = &cobra.Command{
+	Use:   "skill [files-rw]",
+	Short: "List bundled files-rw skills, or print one - if you're an agent, you'll want to load this",
+	Long: `With no argument, lists the bundled files-rw skills (name and description) and exits.
+With a name (files-rw), prints that skill's full guidance (skills/files-rw/SKILL.md) directly to stdout.
+
+If you're an agent operating in a gated workspace, "files-rw skill" is a reasonable first move.`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if len(args) == 0 {
+			skills, err := bundledSkills()
+			if err != nil {
+				return err
+			}
+			fmt.Println("Available skills:")
+			for _, sk := range skills {
+				fmt.Printf("  %-8s  %s\n", sk.ShortName, sk.Skill.Description)
+			}
+			fmt.Println(`Run "files-rw skill <name>" to print one.`)
+			return nil
+		}
+		content, err := getSkillContent(args[0])
+		if err != nil {
+			return err
+		}
+		fmt.Print(content)
+		return nil
+	},
+}
+
 func init() {
 	readCmd.Flags().IntVarP(&readStart, "start", "s", 0, "1-indexed starting line number")
 	readCmd.Flags().IntVarP(&readEnd, "end", "e", 0, "1-indexed ending line number")
@@ -325,6 +439,7 @@ func init() {
 	rootCmd.AddCommand(tailCmd)
 	rootCmd.AddCommand(appendCmd)
 	rootCmd.AddCommand(accessCmd)
+	rootCmd.AddCommand(skillCmd)
 }
 
 func main() {
