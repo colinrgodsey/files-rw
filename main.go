@@ -31,15 +31,17 @@ var (
 	listLong      bool
 	listAll       bool
 	listRecursive bool
+	listJSON      bool
 
+	symlinkForce    bool
 	writeAllowEmpty bool
 )
 
 var rootCmd = &cobra.Command{
 	Use:   "files-rw",
-	Short: "Per-directory allowed file read/write/edit/patch/copy/move/delete/list/tail/append/access tool for AI agents",
+	Short: "Per-directory allowed file read/write/edit/patch/copy/move/delete/list/symlink/tail/append/access tool for AI agents",
 	Long: `files-rw provides an explicit, per-directory-scoped file manipulation tool suite
-(read, write, edit, patch, copy, move, delete, list, tail, append, access) for AI agents, gated by a FILES_RW_ACCESS allowlist file in the current working directory. Run "files-rw access" to see what's actually granted before guessing.
+(read, write, edit, patch, copy, move, delete, list, symlink, tail, append, access) for AI agents, gated by a FILES_RW_ACCESS allowlist file in the current working directory. Run "files-rw access" to see what's actually granted before guessing.
 
 There is no separate directory-creation command: "write" and "append" both create any missing parent directories automatically, so creating a file inside a not-yet-existing folder creates the folder as a side effect.`,
 	SilenceUsage: true,
@@ -226,12 +228,30 @@ var listCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		out, err := filesrw.ListDir(access, target, cwd, listLong, listAll, listRecursive)
+		out, err := filesrw.ListDir(access, target, cwd, listLong, listAll, listRecursive, listJSON)
 		if err != nil {
 			return err
 		}
 		fmt.Print(out)
 		return nil
+	},
+}
+
+var symlinkCmd = &cobra.Command{
+	Use:   "symlink <link> <target>",
+	Short: "Create a symlink pointing to target",
+	Long:  "Create a symlink at <link> pointing to <target>. Target is stored verbatim (relative stays relative). Use --force to overwrite an existing link.",
+	Args:  cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("failed to get working directory: %w", err)
+		}
+		access, err := filesrw.LoadAccess(cwd)
+		if err != nil {
+			return err
+		}
+		return filesrw.SymlinkFile(access, args[0], args[1], cwd, symlinkForce)
 	},
 }
 
@@ -424,6 +444,9 @@ func init() {
 	listCmd.Flags().BoolVarP(&listLong, "long", "l", false, "use long listing format")
 	listCmd.Flags().BoolVarP(&listAll, "all", "a", false, "do not ignore entries starting with .")
 	listCmd.Flags().BoolVarP(&listRecursive, "recursive", "R", false, "list subdirectories recursively")
+	listCmd.Flags().BoolVar(&listJSON, "json", false, "output in JSON format")
+
+	symlinkCmd.Flags().BoolVarP(&symlinkForce, "force", "f", false, "overwrite an existing link")
 
 	writeCmd.Flags().BoolVar(&writeAllowEmpty, "allow-empty", false, "Allow writing empty (zero-byte) content from stdin")
 
@@ -436,6 +459,7 @@ func init() {
 	rootCmd.AddCommand(editCmd)
 	rootCmd.AddCommand(patchCmd)
 	rootCmd.AddCommand(listCmd)
+	rootCmd.AddCommand(symlinkCmd)
 	rootCmd.AddCommand(tailCmd)
 	rootCmd.AddCommand(appendCmd)
 	rootCmd.AddCommand(accessCmd)

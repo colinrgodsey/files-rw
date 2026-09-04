@@ -2,12 +2,15 @@ package filesrw
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/bluekeyes/go-gitdiff/gitdiff"
 )
@@ -219,13 +222,49 @@ func MoveFile(acc *Access, srcPath, dstPath, cwd string) error {
 }
 
 // DeleteFile removes path after verifying access.
+// If path is a symlink, only the symlink itself is removed, never the target.
 func DeleteFile(acc *Access, path, cwd string) error {
-	canonPath, err := acc.Resolve(path, cwd, true)
+	canonPath, err := acc.ResolveNoFollow(path, cwd, true)
 	if err != nil {
 		return err
 	}
 	if err := os.Remove(canonPath); err != nil {
 		return fmt.Errorf("failed to delete %s: %w", canonPath, err)
+	}
+	return nil
+}
+
+// SymlinkFile creates a symlink at linkPath pointing to target.
+// Target is stored verbatim (relative stays relative).
+// If force is true, overwrites an existing link or file.
+func SymlinkFile(acc *Access, linkPath, target, cwd string, force bool) error {
+	canonLink, err := acc.ResolveSymlinkCreation(linkPath, target, cwd)
+	if err != nil {
+		return err
+	}
+
+	dir := filepath.Dir(canonLink)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("failed to create parent directory %s: %w", dir, err)
+	}
+
+	fi, err := os.Lstat(canonLink)
+	if err == nil {
+		if !force {
+			return fmt.Errorf("file %s already exists - use --force to overwrite", linkPath)
+		}
+		if fi.IsDir() {
+			return fmt.Errorf("cannot overwrite directory %s with symlink", linkPath)
+		}
+		if err := os.Remove(canonLink); err != nil {
+			return fmt.Errorf("failed to remove existing file %s: %w", canonLink, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to stat %s: %w", canonLink, err)
+	}
+
+	if err := os.Symlink(target, canonLink); err != nil {
+		return fmt.Errorf("failed to create symlink %s: %w", linkPath, err)
 	}
 	return nil
 }
@@ -298,38 +337,255 @@ func PatchFile(acc *Access, path, cwd string, diff string) error {
 	return WriteFile(acc, path, cwd, buf.String())
 }
 
-// ListDir shells out to the system `ls` for path, passing through only
-// a fixed set of recognized boolean flags.
-func ListDir(acc *Access, path, cwd string, long, all, recursive bool) (string, error) {
-	canonPath, err := acc.Resolve(path, cwd, false)
+// ListEntry represents a single entry in a ListDir result.
+type ListEntry struct {
+	Name     string `json:"name"`
+	Path     string `json:"path"`
+	Type     string `json:"type"`
+	Size     int64  `json:"size"`
+	Mode     string `json:"mode,omitempty"`
+	ModTime  string `json:"mod_time,omitempty"`
+	Target   string `json:"target,omitempty"`
+	Resolved string `json:"resolved,omitempty"`
+}
+
+func formatLong(fi os.FileInfo, name, target string) string {
+	stat, sysOk := fi.Sys().(*syscall.Stat_t)
+	nlink := uint64(1)
+	userName := "user"
+	groupName := "group"
+	if sysOk {
+		nlink = uint64(stat.Nlink)
+		userName = strconv.FormatUint(uint64(stat.Uid), 10)
+		if u, err := user.LookupId(userName); err == nil && u.Username != "" {
+			userName = u.Username
+		}
+		groupName = strconv.FormatUint(uint64(stat.Gid), 10)
+		if g, err := user.LookupGroupId(groupName); err == nil && g.Name != "" {
+			groupName = g.Name
+		}
+	}
+	displayName := name
+	if target != "" {
+		displayName = name + " -> " + target
+	}
+	return fmt.Sprintf("%s %d %s %s %8d %s %s\n",
+		fi.Mode().String(),
+		nlink,
+		userName,
+		groupName,
+		fi.Size(),
+		fi.ModTime().Format("Jan _2 15:04"),
+		displayName,
+	)
+}
+
+func walkDirJSON(acc *Access, dirPath, relPrefix string, all, recursive bool, entries *[]ListEntry) error {
+	dirEntries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return fmt.Errorf("failed to read directory %s: %w", dirPath, err)
+	}
+
+	for _, de := range dirEntries {
+		name := de.Name()
+		if !all && strings.HasPrefix(name, ".") {
+			continue
+		}
+
+		fullPath := filepath.Join(dirPath, name)
+		relPath := name
+		if relPrefix != "" {
+			relPath = filepath.Join(relPrefix, name)
+		}
+
+		fi, err := os.Lstat(fullPath)
+		if err != nil {
+			return fmt.Errorf("failed to stat %s: %w", fullPath, err)
+		}
+
+		entry := ListEntry{
+			Name:    name,
+			Path:    relPath,
+			Size:    fi.Size(),
+			Mode:    fi.Mode().String(),
+			ModTime: fi.ModTime().Format("Jan _2 15:04"),
+		}
+
+		switch {
+		case fi.Mode()&os.ModeSymlink != 0:
+			entry.Type = "symlink"
+			rawTarget, err := os.Readlink(fullPath)
+			if err == nil {
+				entry.Target = rawTarget
+				entry.Resolved = acc.resolveSymlinkEntry(fullPath, rawTarget)
+			}
+		case fi.IsDir():
+			entry.Type = "dir"
+		case fi.Mode().IsRegular():
+			entry.Type = "file"
+		default:
+			entry.Type = "other"
+		}
+
+		*entries = append(*entries, entry)
+
+		if recursive && fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
+			if err := walkDirJSON(acc, fullPath, relPath, all, recursive, entries); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func walkDirText(acc *Access, dirPath, displayPath string, long, all, recursive bool) (string, error) {
+	var b strings.Builder
+
+	type dirTask struct {
+		absPath     string
+		displayPath string
+	}
+
+	tasks := []dirTask{{absPath: dirPath, displayPath: displayPath}}
+
+	for taskIdx := 0; taskIdx < len(tasks); taskIdx++ {
+		cur := tasks[taskIdx]
+		dirEntries, err := os.ReadDir(cur.absPath)
+		if err != nil {
+			return "", fmt.Errorf("failed to read directory %s: %w", cur.absPath, err)
+		}
+
+		if recursive {
+			if taskIdx > 0 {
+				b.WriteString("\n")
+			}
+			fmt.Fprintf(&b, "%s:\n", cur.displayPath)
+		}
+
+		var subdirs []dirTask
+		for _, de := range dirEntries {
+			name := de.Name()
+			if !all && strings.HasPrefix(name, ".") {
+				continue
+			}
+
+			fullPath := filepath.Join(cur.absPath, name)
+			fi, err := os.Lstat(fullPath)
+			if err != nil {
+				return "", fmt.Errorf("failed to stat %s: %w", fullPath, err)
+			}
+
+			target := ""
+			if fi.Mode()&os.ModeSymlink != 0 {
+				if t, err := os.Readlink(fullPath); err == nil {
+					target = t
+				}
+			}
+
+			if long {
+				b.WriteString(formatLong(fi, name, target))
+			} else {
+				if target != "" {
+					fmt.Fprintf(&b, "%s -> %s\n", name, target)
+				} else {
+					fmt.Fprintf(&b, "%s\n", name)
+				}
+			}
+
+			if recursive && fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
+				subDisplay := filepath.Join(cur.displayPath, name)
+				subdirs = append(subdirs, dirTask{absPath: fullPath, displayPath: subDisplay})
+			}
+		}
+
+		if recursive {
+			tasks = append(tasks, subdirs...)
+		}
+	}
+
+	return b.String(), nil
+}
+
+// ListDir inspects path or lists directory contents natively using os.ReadDir,
+// os.Lstat, and os.Readlink, supporting structured symlink metadata.
+func ListDir(acc *Access, path, cwd string, long, all, recursive, asJSON bool) (string, error) {
+	canonPath, err := acc.ResolveNoFollow(path, cwd, false)
 	if err != nil {
 		return "", err
 	}
 
-	if _, err := exec.LookPath("ls"); err != nil {
-		return "", fmt.Errorf("the \"ls\" command is not available on PATH: %w", err)
+	fi, err := os.Lstat(canonPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to stat %s: %w", path, err)
 	}
 
-	var flags []string
-	if long {
-		flags = append(flags, "-l")
+	if fi.Mode()&os.ModeSymlink != 0 {
+		rawTarget, err := os.Readlink(canonPath)
+		if err != nil {
+			return "", fmt.Errorf("failed to readlink %s: %w", canonPath, err)
+		}
+		resolved := acc.resolveSymlinkEntry(canonPath, rawTarget)
+		entry := ListEntry{
+			Name:     filepath.Base(path),
+			Path:     path,
+			Type:     "symlink",
+			Size:     fi.Size(),
+			Mode:     fi.Mode().String(),
+			ModTime:  fi.ModTime().Format("Jan _2 15:04"),
+			Target:   rawTarget,
+			Resolved: resolved,
+		}
+		if asJSON {
+			data, err := json.MarshalIndent([]ListEntry{entry}, "", "  ")
+			if err != nil {
+				return "", err
+			}
+			return string(data) + "\n", nil
+		}
+		if long {
+			return formatLong(fi, entry.Name, entry.Target), nil
+		}
+		return entry.Name + " -> " + entry.Target + "\n", nil
 	}
-	if all {
-		flags = append(flags, "-a")
-	}
-	if recursive {
-		flags = append(flags, "-R")
-	}
-	args := append(flags, "--", canonPath)
 
-	cmd := exec.Command("ls", args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("ls failed: %w: %s", err, stderr.String())
+	if !fi.IsDir() {
+		entry := ListEntry{
+			Name:    filepath.Base(path),
+			Path:    path,
+			Type:    "file",
+			Size:    fi.Size(),
+			Mode:    fi.Mode().String(),
+			ModTime: fi.ModTime().Format("Jan _2 15:04"),
+		}
+		if asJSON {
+			data, err := json.MarshalIndent([]ListEntry{entry}, "", "  ")
+			if err != nil {
+				return "", err
+			}
+			return string(data) + "\n", nil
+		}
+		if long {
+			return formatLong(fi, entry.Name, ""), nil
+		}
+		return entry.Name + "\n", nil
 	}
-	return stdout.String(), nil
+
+	if asJSON {
+		var entries []ListEntry
+		if err := walkDirJSON(acc, canonPath, "", all, recursive, &entries); err != nil {
+			return "", err
+		}
+		if len(entries) == 0 {
+			return "[]\n", nil
+		}
+		data, err := json.MarshalIndent(entries, "", "  ")
+		if err != nil {
+			return "", err
+		}
+		return string(data) + "\n", nil
+	}
+
+	return walkDirText(acc, canonPath, path, long, all, recursive)
 }
 
 // TailFile opens path via acc.OpenFile and returns the last numLines lines (default 10)

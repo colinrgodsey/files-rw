@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -137,5 +139,179 @@ Body content here.`
 	}
 	if info2.Description != "Skill fallback" {
 		t.Errorf("expected description 'Skill fallback', got %q", info2.Description)
+	}
+}
+
+func captureStdout(f func() error) (string, error) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return "", err
+	}
+	oldStdout := os.Stdout
+	os.Stdout = w
+
+	outChan := make(chan string)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		_ = r.Close()
+		outChan <- buf.String()
+	}()
+
+	runErr := f()
+	_ = w.Close()
+	os.Stdout = oldStdout
+	out := <-outChan
+	return out, runErr
+}
+
+func TestSymlinkCmd(t *testing.T) {
+	tempDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to eval symlinks: %v", err)
+	}
+
+	accessFile := filepath.Join(tempDir, "FILES_RW_ACCESS")
+	if err := os.WriteFile(accessFile, []byte("w: .\n"), 0o600); err != nil {
+		t.Fatalf("failed to write access file: %v", err)
+	}
+
+	origWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get wd: %v", err)
+	}
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("failed to chdir: %v", err)
+	}
+	defer os.Chdir(origWd)
+
+	targetFile := filepath.Join(tempDir, "target.txt")
+	if err := os.WriteFile(targetFile, []byte("target content"), 0o600); err != nil {
+		t.Fatalf("failed to write target: %v", err)
+	}
+
+	// 1. Create symlink
+	symlinkForce = false
+	rootCmd.SetArgs([]string{"symlink", "link.txt", "target.txt"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("symlink cmd failed: %v", err)
+	}
+	linkPath := filepath.Join(tempDir, "link.txt")
+	gotTarget, err := os.Readlink(linkPath)
+	if err != nil {
+		t.Fatalf("failed to readlink: %v", err)
+	}
+	if gotTarget != "target.txt" {
+		t.Errorf("readlink = %q, want 'target.txt'", gotTarget)
+	}
+
+	// 2. Overwrite without force must fail
+	rootCmd.SetArgs([]string{"symlink", "link.txt", "other.txt"})
+	if err := rootCmd.Execute(); err == nil {
+		t.Fatal("expected error without --force, got nil")
+	}
+
+	// 3. Overwrite with --force succeeds
+	symlinkForce = false
+	rootCmd.SetArgs([]string{"symlink", "--force", "link.txt", "other.txt"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("symlink cmd with --force failed: %v", err)
+	}
+	gotTarget, err = os.Readlink(linkPath)
+	if err != nil {
+		t.Fatalf("failed to readlink: %v", err)
+	}
+	if gotTarget != "other.txt" {
+		t.Errorf("readlink = %q, want 'other.txt'", gotTarget)
+	}
+}
+
+func TestListCmd_JSONAndSuffix(t *testing.T) {
+	tempDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to eval symlinks: %v", err)
+	}
+
+	accessFile := filepath.Join(tempDir, "FILES_RW_ACCESS")
+	if err := os.WriteFile(accessFile, []byte("w: .\n"), 0o600); err != nil {
+		t.Fatalf("failed to write access file: %v", err)
+	}
+
+	origWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get wd: %v", err)
+	}
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("failed to chdir: %v", err)
+	}
+	defer os.Chdir(origWd)
+
+	targetFile := filepath.Join(tempDir, "target.txt")
+	if err := os.WriteFile(targetFile, []byte("hello"), 0o600); err != nil {
+		t.Fatalf("failed to write target: %v", err)
+	}
+	linkPath := filepath.Join(tempDir, "my_link.txt")
+	if err := os.Symlink("target.txt", linkPath); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	// 1. Non-JSON list shows -> target suffix
+	listLong = false
+	listAll = false
+	listRecursive = false
+	listJSON = false
+	out, err := captureStdout(func() error {
+		rootCmd.SetArgs([]string{"list", "."})
+		return rootCmd.Execute()
+	})
+	if err != nil {
+		t.Fatalf("list cmd failed: %v", err)
+	}
+	if !strings.Contains(out, "my_link.txt -> target.txt") {
+		t.Errorf("expected output to contain 'my_link.txt -> target.txt', got: %q", out)
+	}
+
+	// 2. JSON list outputs structured entries
+	listLong = false
+	listAll = false
+	listRecursive = false
+	listJSON = false
+	jsonOut, err := captureStdout(func() error {
+		rootCmd.SetArgs([]string{"list", "--json", "."})
+		return rootCmd.Execute()
+	})
+	if err != nil {
+		t.Fatalf("list --json cmd failed: %v", err)
+	}
+
+	type jsonEntry struct {
+		Name     string `json:"name"`
+		Type     string `json:"type"`
+		Target   string `json:"target"`
+		Resolved string `json:"resolved"`
+	}
+	var entries []jsonEntry
+	if err := json.Unmarshal([]byte(jsonOut), &entries); err != nil {
+		t.Fatalf("failed to unmarshal JSON output %q: %v", jsonOut, err)
+	}
+
+	var foundLink *jsonEntry
+	for i := range entries {
+		if entries[i].Name == "my_link.txt" {
+			foundLink = &entries[i]
+			break
+		}
+	}
+	if foundLink == nil {
+		t.Fatalf("link entry 'my_link.txt' not found in JSON entries: %+v", entries)
+	}
+	if foundLink.Type != "symlink" {
+		t.Errorf("type = %q, want 'symlink'", foundLink.Type)
+	}
+	if foundLink.Target != "target.txt" {
+		t.Errorf("target = %q, want 'target.txt'", foundLink.Target)
+	}
+	if foundLink.Resolved != targetFile {
+		t.Errorf("resolved = %q, want %q", foundLink.Resolved, targetFile)
 	}
 }

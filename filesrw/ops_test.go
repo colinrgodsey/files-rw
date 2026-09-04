@@ -1,6 +1,8 @@
 package filesrw
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -351,7 +353,7 @@ func TestListDir(t *testing.T) {
 		t.Fatalf("failed to write alpha: %v", err)
 	}
 
-	out, err := ListDir(acc, ".", tempDir, false, false, false)
+	out, err := ListDir(acc, ".", tempDir, false, false, false, false)
 	if err != nil {
 		t.Fatalf("ListDir failed: %v", err)
 	}
@@ -409,5 +411,497 @@ func TestAppendFile(t *testing.T) {
 	expected := "line 1\nline 2\nline 3\n"
 	if string(readBack) != expected {
 		t.Errorf("got %q, expected %q", string(readBack), expected)
+	}
+}
+
+func helperSetupMultiRootAccess(t *testing.T) (string, *Access, string, string, string) {
+	tempDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to eval symlinks for tempDir: %v", err)
+	}
+
+	writableDir := filepath.Join(tempDir, "writable")
+	readonlyDir := filepath.Join(tempDir, "readonly")
+	outsideDir := filepath.Join(tempDir, "outside")
+
+	for _, d := range []string{writableDir, readonlyDir, outsideDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("failed to create dir %s: %v", d, err)
+		}
+	}
+
+	accessContent := strings.Join([]string{
+		"w: writable",
+		"r: readonly",
+	}, "\n") + "\n"
+
+	accessFile := filepath.Join(tempDir, AccessFileName)
+	if err := os.WriteFile(accessFile, []byte(accessContent), 0o600); err != nil {
+		t.Fatalf("failed to write access file: %v", err)
+	}
+
+	acc, err := LoadAccess(tempDir)
+	if err != nil {
+		t.Fatalf("LoadAccess failed: %v", err)
+	}
+	return tempDir, acc, writableDir, readonlyDir, outsideDir
+}
+
+// (a) symlink create succeeds with write@source + read@target
+func TestSymlink_Create_Success(t *testing.T) {
+	tempDir, acc, writableDir, readonlyDir, _ := helperSetupMultiRootAccess(t)
+
+	targetFile := filepath.Join(readonlyDir, "target.txt")
+	if err := os.WriteFile(targetFile, []byte("target payload\n"), 0o600); err != nil {
+		t.Fatalf("failed to write target: %v", err)
+	}
+
+	linkRel := "writable/link.txt"
+	targetRel := "../readonly/target.txt"
+	if err := SymlinkFile(acc, linkRel, targetRel, tempDir, false); err != nil {
+		t.Fatalf("SymlinkFile failed: %v", err)
+	}
+
+	linkPath := filepath.Join(writableDir, "link.txt")
+	gotTarget, err := os.Readlink(linkPath)
+	if err != nil {
+		t.Fatalf("failed to readlink: %v", err)
+	}
+	if gotTarget != targetRel {
+		t.Errorf("readlink = %q, want %q", gotTarget, targetRel)
+	}
+
+	readContent, err := ReadFile(acc, linkRel, tempDir, 0, 0, false)
+	if err != nil {
+		t.Fatalf("ReadFile through symlink failed: %v", err)
+	}
+	if readContent != "target payload\n" {
+		t.Errorf("ReadFile = %q, want %q", readContent, "target payload\n")
+	}
+}
+
+// (b) create DENIED when caller lacks read coverage at the target (even if source writable)
+func TestSymlink_Create_Denied_NoReadCoverage(t *testing.T) {
+	tempDir, acc, writableDir, _, outsideDir := helperSetupMultiRootAccess(t)
+
+	secretFile := filepath.Join(outsideDir, "secret.txt")
+	if err := os.WriteFile(secretFile, []byte("super_secret\n"), 0o600); err != nil {
+		t.Fatalf("failed to write secret: %v", err)
+	}
+
+	// Relative target outside granted roots
+	err := SymlinkFile(acc, "writable/leak_rel.txt", "../outside/secret.txt", tempDir, false)
+	if err == nil {
+		t.Fatal("expected symlink create to be denied when target lacks read coverage, got nil")
+	}
+	if !strings.Contains(err.Error(), "read access denied") {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(writableDir, "leak_rel.txt")); !os.IsNotExist(err) {
+		t.Error("link should not have been created on failure")
+	}
+
+	// Absolute target outside granted roots
+	err = SymlinkFile(acc, "writable/leak_abs.txt", secretFile, tempDir, false)
+	if err == nil {
+		t.Fatal("expected symlink create to be denied with absolute outside target, got nil")
+	}
+	if !strings.Contains(err.Error(), "read access denied") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// (c) dangling forward-link creation inside a read-covered root still allowed (coverage-based)
+func TestSymlink_Create_DanglingCoverageBased(t *testing.T) {
+	tempDir, acc, writableDir, readonlyDir, _ := helperSetupMultiRootAccess(t)
+
+	// Target in readonly root does not exist yet (runtime.json forward creation pattern)
+	futureFile := filepath.Join(readonlyDir, "future.json")
+	if _, err := os.Stat(futureFile); !os.IsNotExist(err) {
+		t.Fatal("future target must not exist for this test")
+	}
+
+	err := SymlinkFile(acc, "writable/forward.json", "../readonly/future.json", tempDir, false)
+	if err != nil {
+		t.Fatalf("expected forward link creation inside read-covered root to succeed, got: %v", err)
+	}
+
+	linkPath := filepath.Join(writableDir, "forward.json")
+	target, err := os.Readlink(linkPath)
+	if err != nil {
+		t.Fatalf("failed to read created link: %v", err)
+	}
+	if target != "../readonly/future.json" {
+		t.Errorf("got target %q, want %q", target, "../readonly/future.json")
+	}
+}
+
+// (d) list shows type/target/resolved for a symlink, dangling and blocked states included (blocked value only ever "blocked", never the path)
+func TestListDir_SymlinkStatesJSON(t *testing.T) {
+	tempDir, acc, writableDir, readonlyDir, outsideDir := helperSetupMultiRootAccess(t)
+
+	// 1. Present and reachable
+	realTarget := filepath.Join(readonlyDir, "present.txt")
+	if err := os.WriteFile(realTarget, []byte("ok"), 0o600); err != nil {
+		t.Fatalf("failed to write present target: %v", err)
+	}
+	if err := SymlinkFile(acc, "writable/link_reachable", "../readonly/present.txt", tempDir, false); err != nil {
+		t.Fatalf("failed to create reachable link: %v", err)
+	}
+
+	// 2. Missing/dangling inside read-covered root
+	if err := SymlinkFile(acc, "writable/link_dangling", "../readonly/missing.txt", tempDir, false); err != nil {
+		t.Fatalf("failed to create dangling link: %v", err)
+	}
+
+	// 3. Blocked: points outside granted roots (created directly on disk)
+	secretPath := filepath.Join(outsideDir, "secret.txt")
+	if err := os.WriteFile(secretPath, []byte("shh"), 0o600); err != nil {
+		t.Fatalf("failed to write secret: %v", err)
+	}
+	if err := os.Symlink(secretPath, filepath.Join(writableDir, "link_blocked")); err != nil {
+		t.Fatalf("failed to create blocked link: %v", err)
+	}
+
+	out, err := ListDir(acc, "writable", tempDir, false, false, false, true)
+	if err != nil {
+		t.Fatalf("ListDir asJSON failed: %v", err)
+	}
+
+	var entries []ListEntry
+	if err := json.Unmarshal([]byte(out), &entries); err != nil {
+		t.Fatalf("failed to unmarshal ListDir JSON output %q: %v", out, err)
+	}
+
+	byName := make(map[string]ListEntry)
+	for _, e := range entries {
+		byName[e.Name] = e
+	}
+
+	// Check reachable
+	reach, ok := byName["link_reachable"]
+	if !ok {
+		t.Fatal("link_reachable entry not found in list")
+	}
+	if reach.Type != "symlink" {
+		t.Errorf("link_reachable type = %q, want symlink", reach.Type)
+	}
+	if reach.Target != "../readonly/present.txt" {
+		t.Errorf("link_reachable target = %q, want ../readonly/present.txt", reach.Target)
+	}
+	if reach.Resolved != realTarget {
+		t.Errorf("link_reachable resolved = %q, want %q", reach.Resolved, realTarget)
+	}
+
+	// Check dangling
+	dang, ok := byName["link_dangling"]
+	if !ok {
+		t.Fatal("link_dangling entry not found in list")
+	}
+	if dang.Type != "symlink" {
+		t.Errorf("link_dangling type = %q, want symlink", dang.Type)
+	}
+	if dang.Target != "../readonly/missing.txt" {
+		t.Errorf("link_dangling target = %q, want ../readonly/missing.txt", dang.Target)
+	}
+	if dang.Resolved != "dangling" {
+		t.Errorf("link_dangling resolved = %q, want dangling", dang.Resolved)
+	}
+
+	// Check blocked
+	block, ok := byName["link_blocked"]
+	if !ok {
+		t.Fatal("link_blocked entry not found in list")
+	}
+	if block.Type != "symlink" {
+		t.Errorf("link_blocked type = %q, want symlink", block.Type)
+	}
+	if block.Target != secretPath {
+		t.Errorf("link_blocked target = %q, want %q", block.Target, secretPath)
+	}
+	if block.Resolved != "blocked" {
+		t.Errorf("link_blocked resolved = %q, want blocked", block.Resolved)
+	}
+	if strings.Contains(block.Resolved, secretPath) || strings.Contains(block.Resolved, "outside") {
+		t.Errorf("blocked state leaked path: %q", block.Resolved)
+	}
+}
+
+// (e) read/write/patch/cat through a symlink follows transparently incl. the existing deny-outside-root case
+func TestSymlink_DereferenceOps(t *testing.T) {
+	tempDir, acc, writableDir, _, outsideDir := helperSetupMultiRootAccess(t)
+
+	targetPath := filepath.Join(writableDir, "real_target.txt")
+	initial := "line 1\nline 2\nline 3\n"
+	if err := os.WriteFile(targetPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("failed to write initial target: %v", err)
+	}
+
+	linkRel := "writable/sym_link.txt"
+	if err := SymlinkFile(acc, linkRel, "real_target.txt", tempDir, false); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	// 1. Read through symlink
+	readOut, err := ReadFile(acc, linkRel, tempDir, 0, 0, false)
+	if err != nil {
+		t.Fatalf("ReadFile through symlink failed: %v", err)
+	}
+	if readOut != initial {
+		t.Errorf("read = %q, want %q", readOut, initial)
+	}
+
+	// 2. Cat through symlink
+	var buf strings.Builder
+	if err := CatFile(acc, linkRel, tempDir, &buf); err != nil {
+		t.Fatalf("CatFile through symlink failed: %v", err)
+	}
+	if buf.String() != initial {
+		t.Errorf("cat = %q, want %q", buf.String(), initial)
+	}
+
+	// 3. Write through symlink
+	newContent := "written via symlink\n"
+	if err := WriteFile(acc, linkRel, tempDir, newContent); err != nil {
+		t.Fatalf("WriteFile through symlink failed: %v", err)
+	}
+	targetBytes, _ := os.ReadFile(targetPath)
+	if string(targetBytes) != newContent {
+		t.Errorf("target file content = %q, want %q", string(targetBytes), newContent)
+	}
+	fi, err := os.Lstat(filepath.Join(writableDir, "sym_link.txt"))
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("sym_link.txt should still be a symlink")
+	}
+
+	// 4. Patch through symlink
+	diff := strings.Join([]string{
+		"--- real_target.txt",
+		"+++ real_target.txt",
+		"@@ -1,1 +1,1 @@",
+		"-written via symlink",
+		"+patched via symlink",
+	}, "\n") + "\n"
+	if err := PatchFile(acc, linkRel, tempDir, diff); err != nil {
+		t.Fatalf("PatchFile through symlink failed: %v", err)
+	}
+	targetBytes, _ = os.ReadFile(targetPath)
+	if string(targetBytes) != "patched via symlink\n" {
+		t.Errorf("target file content = %q, want %q", string(targetBytes), "patched via symlink\n")
+	}
+
+	// 5. Existing deny-outside-root case
+	outsideSecret := filepath.Join(outsideDir, "escape.txt")
+	_ = os.WriteFile(outsideSecret, []byte("escape"), 0o600)
+	outsideLink := filepath.Join(writableDir, "outside_link.txt")
+	_ = os.Symlink(outsideSecret, outsideLink)
+
+	if _, err := ReadFile(acc, "writable/outside_link.txt", tempDir, 0, 0, false); err == nil {
+		t.Error("expected ReadFile through outside symlink to be denied")
+	}
+	if err := WriteFile(acc, "writable/outside_link.txt", tempDir, "hacked"); err == nil {
+		t.Error("expected WriteFile through outside symlink to be denied")
+	}
+	buf.Reset()
+	if err := CatFile(acc, "writable/outside_link.txt", tempDir, &buf); err == nil {
+		t.Error("expected CatFile through outside symlink to be denied")
+	}
+	if err := PatchFile(acc, "writable/outside_link.txt", tempDir, diff); err == nil {
+		t.Error("expected PatchFile through outside symlink to be denied")
+	}
+}
+
+// (f) chain cap of 8 errors, cycle case errors
+func TestSymlink_ChainsAndCycles(t *testing.T) {
+	tempDir, acc, writableDir, _, _ := helperSetupMultiRootAccess(t)
+
+	// 1. Direct cycle: c1 -> c2, c2 -> c1
+	c1 := filepath.Join(writableDir, "c1")
+	c2 := filepath.Join(writableDir, "c2")
+	_ = os.Symlink("c2", c1)
+	_ = os.Symlink("c1", c2)
+
+	_, err := ReadFile(acc, "writable/c1", tempDir, 0, 0, false)
+	if err == nil || !strings.Contains(err.Error(), "exceeded maximum of 8 hops") {
+		t.Errorf("expected cycle to error with hop cap, got %v", err)
+	}
+
+	// 2. Self cycle: self -> self
+	self := filepath.Join(writableDir, "self")
+	_ = os.Symlink("self", self)
+	_, err = ReadFile(acc, "writable/self", tempDir, 0, 0, false)
+	if err == nil || !strings.Contains(err.Error(), "exceeded maximum of 8 hops") {
+		t.Errorf("expected self cycle to error with hop cap, got %v", err)
+	}
+
+	// 3. Exactly 8 hops succeeds
+	target8 := filepath.Join(writableDir, "target8.txt")
+	_ = os.WriteFile(target8, []byte("eight hops\n"), 0o600)
+	_ = os.Symlink("target8.txt", filepath.Join(writableDir, "h8"))
+	for i := 7; i >= 1; i-- {
+		_ = os.Symlink(fmt.Sprintf("h%d", i+1), filepath.Join(writableDir, fmt.Sprintf("h%d", i)))
+	}
+	content, err := ReadFile(acc, "writable/h1", tempDir, 0, 0, false)
+	if err != nil {
+		t.Fatalf("expected 8-hop chain to succeed, got: %v", err)
+	}
+	if content != "eight hops\n" {
+		t.Errorf("got %q, want 'eight hops\n'", content)
+	}
+
+	// 4. Exceeding 8 hops (9 hops) errors
+	_ = os.Symlink("h1", filepath.Join(writableDir, "h0"))
+	_, err = ReadFile(acc, "writable/h0", tempDir, 0, 0, false)
+	if err == nil || !strings.Contains(err.Error(), "exceeded maximum of 8 hops") {
+		t.Errorf("expected 9-hop chain to error, got: %v", err)
+	}
+}
+
+// (g) delete on a symlink removes only the link
+func TestDeleteFile_SymlinkOnly(t *testing.T) {
+	tempDir, acc, writableDir, _, _ := helperSetupMultiRootAccess(t)
+
+	targetPath := filepath.Join(writableDir, "keep_target.txt")
+	content := "important data that must not be deleted\n"
+	if err := os.WriteFile(targetPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("failed to write target: %v", err)
+	}
+
+	linkPath := filepath.Join(writableDir, "delete_link.txt")
+	if err := os.Symlink("keep_target.txt", linkPath); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	if err := DeleteFile(acc, "writable/delete_link.txt", tempDir); err != nil {
+		t.Fatalf("DeleteFile failed: %v", err)
+	}
+
+	// Symlink must be removed
+	if _, err := os.Lstat(linkPath); !os.IsNotExist(err) {
+		t.Errorf("expected symlink to be deleted, but it still exists")
+	}
+
+	// Target must be untouched
+	targetData, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("target file was deleted or unreadable: %v", err)
+	}
+	if string(targetData) != content {
+		t.Errorf("target file content modified: %q", string(targetData))
+	}
+
+	// Delete on dangling symlink removes the dangling link
+	danglingLink := filepath.Join(writableDir, "del_dangling.txt")
+	_ = os.Symlink("missing.txt", danglingLink)
+	if err := DeleteFile(acc, "writable/del_dangling.txt", tempDir); err != nil {
+		t.Fatalf("DeleteFile on dangling symlink failed: %v", err)
+	}
+	if _, err := os.Lstat(danglingLink); !os.IsNotExist(err) {
+		t.Errorf("expected dangling symlink to be deleted")
+	}
+}
+
+// (h) write/patch through dangling link errors
+func TestSymlink_DanglingWritePatchError(t *testing.T) {
+	tempDir, acc, writableDir, _, _ := helperSetupMultiRootAccess(t)
+
+	danglingRel := "writable/dangling_action.txt"
+	danglingPath := filepath.Join(writableDir, "dangling_action.txt")
+	nonexistentPath := filepath.Join(writableDir, "missing_dest.txt")
+
+	_ = os.Symlink("missing_dest.txt", danglingPath)
+
+	// Write through dangling link must error
+	err := WriteFile(acc, danglingRel, tempDir, "payload")
+	if err == nil {
+		t.Fatal("expected WriteFile through dangling symlink to error, got nil")
+	}
+	if _, err := os.Stat(nonexistentPath); !os.IsNotExist(err) {
+		t.Error("WriteFile through dangling link must not auto-vivify the target")
+	}
+	fi, err := os.Lstat(danglingPath)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Error("dangling symlink must remain a symlink")
+	}
+
+	// Patch through dangling link must error
+	diff := strings.Join([]string{
+		"--- missing_dest.txt",
+		"+++ missing_dest.txt",
+		"@@ -1,1 +1,1 @@",
+		"-old",
+		"+new",
+	}, "\n") + "\n"
+	err = PatchFile(acc, danglingRel, tempDir, diff)
+	if err == nil {
+		t.Fatal("expected PatchFile through dangling symlink to error, got nil")
+	}
+	if _, err := os.Stat(nonexistentPath); !os.IsNotExist(err) {
+		t.Error("PatchFile through dangling link must not auto-vivify the target")
+	}
+}
+
+// (i) --force overwrites an existing link
+func TestSymlink_ForceOverwrite(t *testing.T) {
+	tempDir, acc, writableDir, _, _ := helperSetupMultiRootAccess(t)
+
+	linkRel := "writable/switchable_link.txt"
+	linkPath := filepath.Join(writableDir, "switchable_link.txt")
+
+	// 1. Create initial link
+	if err := SymlinkFile(acc, linkRel, "first.txt", tempDir, false); err != nil {
+		t.Fatalf("first SymlinkFile failed: %v", err)
+	}
+
+	// 2. Without force, overwrite must error
+	err := SymlinkFile(acc, linkRel, "second.txt", tempDir, false)
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("expected already exists error without force, got %v", err)
+	}
+	target, _ := os.Readlink(linkPath)
+	if target != "first.txt" {
+		t.Errorf("target should still be first.txt, got %q", target)
+	}
+
+	// 3. With force, overwrite succeeds
+	err = SymlinkFile(acc, linkRel, "second.txt", tempDir, true)
+	if err != nil {
+		t.Fatalf("SymlinkFile with force failed: %v", err)
+	}
+	target, _ = os.Readlink(linkPath)
+	if target != "second.txt" {
+		t.Errorf("target should now be second.txt, got %q", target)
+	}
+}
+
+// (j) non-JSON output shows the `-> target` suffix
+func TestListDir_NonJSONSymlinkSuffix(t *testing.T) {
+	tempDir, acc, writableDir, _, _ := helperSetupMultiRootAccess(t)
+
+	regularFile := filepath.Join(writableDir, "normal.txt")
+	_ = os.WriteFile(regularFile, []byte("data"), 0o600)
+
+	linkPath := filepath.Join(writableDir, "my_link.txt")
+	_ = os.Symlink("normal.txt", linkPath)
+
+	// Short non-JSON
+	outShort, err := ListDir(acc, "writable", tempDir, false, false, false, false)
+	if err != nil {
+		t.Fatalf("ListDir short failed: %v", err)
+	}
+	if !strings.Contains(outShort, "my_link.txt -> normal.txt") {
+		t.Errorf("expected short output to contain 'my_link.txt -> normal.txt', got %q", outShort)
+	}
+	if !strings.Contains(outShort, "normal.txt") {
+		t.Errorf("expected short output to contain normal.txt, got %q", outShort)
+	}
+
+	// Long non-JSON
+	outLong, err := ListDir(acc, "writable", tempDir, true, false, false, false)
+	if err != nil {
+		t.Fatalf("ListDir long failed: %v", err)
+	}
+	if !strings.Contains(outLong, "my_link.txt -> normal.txt") {
+		t.Errorf("expected long output to contain 'my_link.txt -> normal.txt', got %q", outLong)
 	}
 }
