@@ -500,14 +500,20 @@ func (a *Access) ResolveSymlinkCreation(linkPath, target, cwd string) (string, e
 	}
 	targetAbs = filepath.Clean(targetAbs)
 
-	canonTarget, err := canonicalizeTarget(targetAbs, cwd)
-	if err != nil {
-		canonTarget = targetAbs
-		dir := targetAbs
+	resolvedTarget, hops, _, err := evalSymlinksHops(targetAbs, MaxSymlinkHops)
+	if hops > MaxSymlinkHops {
+		return "", fmt.Errorf("symlink target %q chain exceeded maximum of %d hops", target, MaxSymlinkHops)
+	}
+
+	var canonTarget string
+	if err == nil {
+		canonTarget = resolvedTarget
+	} else if os.IsNotExist(err) {
+		dir := resolvedTarget
 		var tail []string
 		for {
-			resDir, _, _, dirErr := evalSymlinksHops(dir, MaxSymlinkHops)
-			if dirErr == nil {
+			resDir, dirHops, _, dirErr := evalSymlinksHops(dir, MaxSymlinkHops)
+			if dirErr == nil && dirHops <= MaxSymlinkHops {
 				canonTarget = resDir
 				for i := len(tail) - 1; i >= 0; i-- {
 					canonTarget = filepath.Join(canonTarget, tail[i])
@@ -516,11 +522,14 @@ func (a *Access) ResolveSymlinkCreation(linkPath, target, cwd string) (string, e
 			}
 			parent := filepath.Dir(dir)
 			if parent == dir {
+				canonTarget = resolvedTarget
 				break
 			}
 			tail = append(tail, filepath.Base(dir))
 			dir = parent
 		}
+	} else {
+		return "", fmt.Errorf("failed to resolve symlink target %q: %w", target, err)
 	}
 
 	covered := false
@@ -556,7 +565,7 @@ func (a *Access) resolveSymlinkEntry(entryFullPath, rawTarget string) string {
 		}
 		if os.IsNotExist(err) {
 			targetCovered := false
-			dir := targetAbs
+			dir := canonResolved
 			var tail []string
 			for {
 				resDir, _, _, dirErr := evalSymlinksHops(dir, MaxSymlinkHops)

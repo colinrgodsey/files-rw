@@ -905,3 +905,186 @@ func TestListDir_NonJSONSymlinkSuffix(t *testing.T) {
 		t.Errorf("expected long output to contain 'my_link.txt -> normal.txt', got %q", outLong)
 	}
 }
+
+// Chain test: entry A -> linkB (linkB inside read-covered root), linkB's target Z is
+// BOTH nonexistent AND outside every granted root.
+// Assert: (a) list classifies A as blocked (NOT dangling); (b) symlink creation through A is DENIED.
+func TestSymlink_ChainToUncoveredTarget(t *testing.T) {
+	tempDir, acc, writableDir, readonlyDir, outsideDir := helperSetupMultiRootAccess(t)
+
+	// Target Z is nonexistent and outside every granted root
+	targetZ := filepath.Join(outsideDir, "nonexistent_z.txt")
+	if _, err := os.Stat(targetZ); !os.IsNotExist(err) {
+		t.Fatalf("target Z must not exist: %v", err)
+	}
+
+	// Link B lives inside read-covered root (readonlyDir), pointing to outside nonexistent Z
+	linkB := filepath.Join(readonlyDir, "linkB")
+	if err := os.Symlink(targetZ, linkB); err != nil {
+		t.Fatalf("failed to create linkB: %v", err)
+	}
+
+	// Entry A lives in writableDir, pointing to linkB
+	entryA := filepath.Join(writableDir, "entryA")
+	if err := os.Symlink("../readonly/linkB", entryA); err != nil {
+		t.Fatalf("failed to create entryA: %v", err)
+	}
+
+	// (a) ListDir must classify entry A as "blocked", NOT "dangling"
+	out, err := ListDir(acc, "writable", tempDir, false, false, false, true)
+	if err != nil {
+		t.Fatalf("ListDir failed: %v", err)
+	}
+
+	var entries []ListEntry
+	if err := json.Unmarshal([]byte(out), &entries); err != nil {
+		t.Fatalf("failed to unmarshal JSON: %v", err)
+	}
+
+	var foundA *ListEntry
+	for i := range entries {
+		if entries[i].Name == "entryA" {
+			foundA = &entries[i]
+			break
+		}
+	}
+	if foundA == nil {
+		t.Fatalf("entryA not found in ListDir output: %s", out)
+	}
+	if foundA.Type != "symlink" {
+		t.Errorf("entryA type = %q, want 'symlink'", foundA.Type)
+	}
+	if foundA.Resolved != "blocked" {
+		t.Errorf("entryA resolved = %q, want 'blocked' (must NOT be 'dangling')", foundA.Resolved)
+	}
+	if strings.Contains(foundA.Resolved, "outside") || strings.Contains(foundA.Resolved, "nonexistent_z") {
+		t.Errorf("entryA resolved leaked outside path: %q", foundA.Resolved)
+	}
+
+	// (b) Creating newlink -> entryA through the chain must be DENIED
+	err = SymlinkFile(acc, "writable/newlink", "entryA", tempDir, false)
+	if err == nil {
+		t.Fatal("expected creation of newlink -> entryA to be DENIED, got nil")
+	}
+	if !strings.Contains(err.Error(), "read access denied") {
+		t.Errorf("expected 'read access denied' error, got: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(writableDir, "newlink")); !os.IsNotExist(err) {
+		t.Errorf("newlink must not have been created on failure")
+	}
+
+	// Also directly targeting linkB (which points to Z) must be DENIED
+	err = SymlinkFile(acc, "writable/newlink_direct", "../readonly/linkB", tempDir, false)
+	if err == nil {
+		t.Fatal("expected creation of newlink_direct -> linkB to be DENIED, got nil")
+	}
+	if !strings.Contains(err.Error(), "read access denied") {
+		t.Errorf("expected 'read access denied' error, got: %v", err)
+	}
+}
+
+// Oracle-closure differential test: an EXISTING out-of-coverage target vs a NONEXISTENT
+// out-of-coverage target must be treated identically by both list and creation
+// (same blocked/denied outcome, indistinguishable responses proving no existence leak).
+func TestSymlink_OracleClosureDifferential(t *testing.T) {
+	tempDir, acc, writableDir, _, outsideDir := helperSetupMultiRootAccess(t)
+
+	// 1. Existing out-of-coverage target
+	existTarget := filepath.Join(outsideDir, "oracle_exist.txt")
+	if err := os.WriteFile(existTarget, []byte("confidential data"), 0o600); err != nil {
+		t.Fatalf("failed to write existTarget: %v", err)
+	}
+
+	// 2. Nonexistent out-of-coverage target
+	missingTarget := filepath.Join(outsideDir, "oracle_missing.txt")
+	_ = os.Remove(missingTarget)
+	if _, err := os.Stat(missingTarget); !os.IsNotExist(err) {
+		t.Fatalf("missingTarget must not exist")
+	}
+
+	// Create symlinks in writableDir to both targets
+	linkExist := filepath.Join(writableDir, "link_to_exist")
+	if err := os.Symlink(existTarget, linkExist); err != nil {
+		t.Fatalf("failed to create link_to_exist: %v", err)
+	}
+	linkMissing := filepath.Join(writableDir, "link_to_missing")
+	if err := os.Symlink(missingTarget, linkMissing); err != nil {
+		t.Fatalf("failed to create link_to_missing: %v", err)
+	}
+
+	// --- Differential check on ListDir ---
+	out, err := ListDir(acc, "writable", tempDir, false, false, false, true)
+	if err != nil {
+		t.Fatalf("ListDir failed: %v", err)
+	}
+
+	var entries []ListEntry
+	if err := json.Unmarshal([]byte(out), &entries); err != nil {
+		t.Fatalf("failed to unmarshal JSON: %v", err)
+	}
+
+	byName := make(map[string]ListEntry)
+	for _, e := range entries {
+		byName[e.Name] = e
+	}
+
+	entryExist, okExist := byName["link_to_exist"]
+	entryMissing, okMissing := byName["link_to_missing"]
+	if !okExist || !okMissing {
+		t.Fatalf("missing expected entries in ListDir output: %s", out)
+	}
+
+	// Both must be classified identically as "blocked"
+	if entryExist.Resolved != "blocked" {
+		t.Errorf("entryExist resolved = %q, want 'blocked'", entryExist.Resolved)
+	}
+	if entryMissing.Resolved != "blocked" {
+		t.Errorf("entryMissing resolved = %q, want 'blocked'", entryMissing.Resolved)
+	}
+	if entryExist.Resolved != entryMissing.Resolved {
+		t.Errorf("oracle leak: entryExist.Resolved (%q) != entryMissing.Resolved (%q)",
+			entryExist.Resolved, entryMissing.Resolved)
+	}
+
+	// Neither may leak outside paths
+	for _, e := range []ListEntry{entryExist, entryMissing} {
+		if strings.Contains(e.Resolved, outsideDir) || strings.Contains(e.Resolved, "oracle") {
+			t.Errorf("entry %s leaked outside path in resolved: %q", e.Name, e.Resolved)
+		}
+	}
+
+	// --- Differential check on SymlinkFile creation ---
+	errExist := SymlinkFile(acc, "writable/try_exist", existTarget, tempDir, false)
+	errMissing := SymlinkFile(acc, "writable/try_missing", missingTarget, tempDir, false)
+
+	if errExist == nil {
+		t.Fatal("expected creation to existing outside target to be DENIED, got nil")
+	}
+	if errMissing == nil {
+		t.Fatal("expected creation to missing outside target to be DENIED, got nil")
+	}
+
+	// Error messages must follow the exact same structure without leaking existence
+	expectedPrefix := "read access denied for symlink target "
+	if !strings.HasPrefix(errExist.Error(), expectedPrefix) {
+		t.Errorf("errExist unexpected message: %v", errExist)
+	}
+	if !strings.HasPrefix(errMissing.Error(), expectedPrefix) {
+		t.Errorf("errMissing unexpected message: %v", errMissing)
+	}
+	// Neither error may mention file existence, not-found, or stat errors
+	for _, errMsg := range []string{errExist.Error(), errMissing.Error()} {
+		if strings.Contains(strings.ToLower(errMsg), "not exist") ||
+			strings.Contains(strings.ToLower(errMsg), "no such file") {
+			t.Errorf("creation error leaked target existence: %q", errMsg)
+		}
+	}
+
+	// Ensure neither link was created
+	if _, err := os.Lstat(filepath.Join(writableDir, "try_exist")); !os.IsNotExist(err) {
+		t.Error("try_exist link should not exist")
+	}
+	if _, err := os.Lstat(filepath.Join(writableDir, "try_missing")); !os.IsNotExist(err) {
+		t.Error("try_missing link should not exist")
+	}
+}
