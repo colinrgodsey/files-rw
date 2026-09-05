@@ -315,3 +315,87 @@ func TestListCmd_JSONAndSuffix(t *testing.T) {
 		t.Errorf("resolved = %q, want %q", foundLink.Resolved, targetFile)
 	}
 }
+
+func TestMkdirCmd(t *testing.T) {
+	tempDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to eval symlinks: %v", err)
+	}
+
+	accessFile := filepath.Join(tempDir, "FILES_RW_ACCESS")
+	if err := os.WriteFile(accessFile, []byte("w: .\n"), 0o600); err != nil {
+		t.Fatalf("failed to write access file: %v", err)
+	}
+
+	origWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get wd: %v", err)
+	}
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("failed to chdir: %v", err)
+	}
+	defer os.Chdir(origWd)
+
+	// 1. Argument validation: exact 1 argument required
+	rootCmd.SetArgs([]string{"mkdir"})
+	if err := rootCmd.Execute(); err == nil {
+		t.Fatal("expected error with 0 args, got nil")
+	}
+
+	rootCmd.SetArgs([]string{"mkdir", "a", "b"})
+	if err := rootCmd.Execute(); err == nil {
+		t.Fatal("expected error with 2 args, got nil")
+	}
+
+	// 2. Basic mkdir without -p
+	mkdirParents = false
+	rootCmd.SetArgs([]string{"mkdir", "single_dir"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("expected mkdir single_dir to succeed, got: %v", err)
+	}
+	fi, err := os.Stat(filepath.Join(tempDir, "single_dir"))
+	if err != nil || !fi.IsDir() {
+		t.Fatalf("expected single_dir to exist as a directory, got err: %v", err)
+	}
+
+	// 3. Target already exists without -p -> fails with "file exists"
+	mkdirParents = false
+	rootCmd.SetArgs([]string{"mkdir", "single_dir"})
+	err = rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected mkdir single_dir to fail when exists, got nil")
+	}
+	if !strings.Contains(err.Error(), "file exists") {
+		t.Errorf("expected 'file exists' error, got: %v", err)
+	}
+
+	// 4. Missing parent without -p -> fails with "no such file or directory"
+	mkdirParents = false
+	rootCmd.SetArgs([]string{"mkdir", "missing_parent/sub_dir"})
+	err = rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected mkdir missing_parent/sub_dir to fail without -p, got nil")
+	}
+	if !strings.Contains(err.Error(), "no such file or directory") {
+		t.Errorf("expected 'no such file or directory' error, got: %v", err)
+	}
+
+	// 5. With -p flag: creates intermediate parents
+	mkdirParents = false
+	rootCmd.SetArgs([]string{"mkdir", "-p", "nest1/nest2/nest3"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("expected mkdir -p to succeed, got: %v", err)
+	}
+	fi, err = os.Stat(filepath.Join(tempDir, "nest1", "nest2", "nest3"))
+	if err != nil || !fi.IsDir() {
+		t.Fatalf("expected nest1/nest2/nest3 to exist as directory, got err: %v", err)
+	}
+
+	// 6. With --parents flag: idempotent on existing directory
+	mkdirParents = false
+	rootCmd.SetArgs([]string{"mkdir", "--parents", "nest1/nest2/nest3"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("expected mkdir --parents to succeed idempotently, got: %v", err)
+	}
+}
+

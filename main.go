@@ -35,15 +35,16 @@ var (
 
 	symlinkForce    bool
 	writeAllowEmpty bool
+	mkdirParents    bool
 )
 
 var rootCmd = &cobra.Command{
 	Use:   "files-rw",
-	Short: "Per-directory allowed file read/write/edit/patch/copy/move/delete/list/symlink/tail/append/access tool for AI agents",
+	Short: "Per-directory allowed file read/write/edit/patch/copy/move/delete/list/symlink/tail/append/mkdir/access tool for AI agents",
 	Long: `files-rw provides an explicit, per-directory-scoped file manipulation tool suite
-(read, write, edit, patch, copy, move, delete, list, symlink, tail, append, access) for AI agents, gated by a FILES_RW_ACCESS allowlist file in the current working directory. Run "files-rw access" to see what's actually granted before guessing.
+(read, write, edit, patch, copy, move, delete, list, symlink, tail, append, mkdir, access) for AI agents, gated by a FILES_RW_ACCESS allowlist file in the current working directory. Run "files-rw access" to see what's actually granted before guessing.
 
-There is no separate directory-creation command: "write" and "append" both create any missing parent directories automatically, so creating a file inside a not-yet-existing folder creates the folder as a side effect.`,
+Directory creation can be done explicitly with "mkdir" (with optional -p/--parents) or automatically as a side effect of "write" and "append".`,
 	SilenceUsage: true,
 }
 
@@ -324,6 +325,26 @@ var appendCmd = &cobra.Command{
 	},
 }
 
+var mkdirCmd = &cobra.Command{
+	Use:   "mkdir <path>",
+	Short: "Create a directory",
+	Long:  "Create a directory at <path>. Pass -p/--parents to create parent directories as needed without error if the directory already exists.",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("failed to get working directory: %w", err)
+		}
+		access, err := filesrw.LoadAccess(cwd)
+		if err != nil {
+			return err
+		}
+		parents, _ := cmd.Flags().GetBool("parents")
+		return filesrw.Mkdir(access, args[0], cwd, parents)
+	},
+}
+
+
 type skillInfo struct {
 	Name        string
 	Description string
@@ -450,6 +471,8 @@ func init() {
 
 	writeCmd.Flags().BoolVar(&writeAllowEmpty, "allow-empty", false, "Allow writing empty (zero-byte) content from stdin")
 
+	mkdirCmd.Flags().BoolVarP(&mkdirParents, "parents", "p", false, "make parent directories as needed, no error if existing")
+
 	rootCmd.AddCommand(readCmd)
 	rootCmd.AddCommand(catCmd)
 	rootCmd.AddCommand(writeCmd)
@@ -462,6 +485,7 @@ func init() {
 	rootCmd.AddCommand(symlinkCmd)
 	rootCmd.AddCommand(tailCmd)
 	rootCmd.AddCommand(appendCmd)
+	rootCmd.AddCommand(mkdirCmd)
 	rootCmd.AddCommand(accessCmd)
 	rootCmd.AddCommand(skillCmd)
 }

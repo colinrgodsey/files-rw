@@ -269,6 +269,79 @@ func SymlinkFile(acc *Access, linkPath, target, cwd string, force bool) error {
 	return nil
 }
 
+// Mkdir creates a directory at path after verifying write access in acc.
+// If parents is false:
+//   - returns an error if the directory already exists ("file exists")
+//   - returns an error if the parent directory does not exist ("no such file or directory")
+//   - creates the directory with mode 0755
+// If parents is true:
+//   - verifies that all created intermediate directories and the longest existing ancestor
+//     reside within a write-granted root in acc
+//   - creates target and missing parent directories with mode 0755 idempotently
+//   - returns nil if the target already exists and is a directory
+//   - returns an error if the target exists but is a regular file
+func Mkdir(acc *Access, path, cwd string, parents bool) error {
+	canonPath, err := acc.Resolve(path, cwd, true)
+	if err != nil {
+		return err
+	}
+
+	if !parents {
+		if _, err := os.Stat(canonPath); err == nil {
+			return fmt.Errorf("mkdir %s: file exists", path)
+		}
+		if _, err := os.Stat(filepath.Dir(canonPath)); err != nil {
+			return fmt.Errorf("mkdir %s: no such file or directory", path)
+		}
+		if err := os.Mkdir(canonPath, 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", path, err)
+		}
+		return nil
+	}
+
+	fi, err := os.Stat(canonPath)
+	if err == nil {
+		if fi.IsDir() {
+			return nil
+		}
+		return fmt.Errorf("mkdir %s: file exists", path)
+	}
+
+	curr := filepath.Dir(canonPath)
+	var intermediateDirs []string
+	for {
+		st, err := os.Stat(curr)
+		if err == nil {
+			if !st.IsDir() {
+				return fmt.Errorf("mkdir %s: not a directory: %s", path, curr)
+			}
+			break
+		}
+		intermediateDirs = append(intermediateDirs, curr)
+		parent := filepath.Dir(curr)
+		if parent == curr {
+			break
+		}
+		curr = parent
+	}
+
+	if !acc.IsWritable(curr) {
+		return fmt.Errorf("write access denied for %q - ancestor directory %q is not within a write-granted root", path, curr)
+	}
+
+	for _, d := range intermediateDirs {
+		if !acc.IsWritable(d) {
+			return fmt.Errorf("write access denied for %q - intermediate directory %q is not within a write-granted root", path, d)
+		}
+	}
+
+	if err := os.MkdirAll(canonPath, 0o755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", path, err)
+	}
+	return nil
+}
+
+
 // EditFile replaces oldStr with newStr in path after reading through an open handle.
 func EditFile(acc *Access, path, cwd string, oldStr, newStr string, replaceAll bool) error {
 	if oldStr == "" {
