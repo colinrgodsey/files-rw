@@ -1088,3 +1088,267 @@ func TestSymlink_OracleClosureDifferential(t *testing.T) {
 		t.Error("try_missing link should not exist")
 	}
 }
+
+// Tests for Mkdir (Decision D92)
+
+func TestMkdir_Basic(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+
+	dirRel := "new_directory"
+	if err := Mkdir(acc, dirRel, tempDir, false); err != nil {
+		t.Fatalf("Mkdir basic failed: %v", err)
+	}
+
+	fullPath := filepath.Join(tempDir, dirRel)
+	fi, err := os.Stat(fullPath)
+	if err != nil {
+		t.Fatalf("stat created directory failed: %v", err)
+	}
+	if !fi.IsDir() {
+		t.Fatalf("expected created path to be directory, got regular file")
+	}
+	perm := fi.Mode().Perm()
+	if perm != 0o755 {
+		t.Errorf("expected perm 0755, got %o", perm)
+	}
+}
+
+func TestMkdir_WithoutParents_MissingParent(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+
+	dirRel := filepath.Join("missing_parent", "new_directory")
+	err := Mkdir(acc, dirRel, tempDir, false)
+	if err == nil {
+		t.Fatal("expected Mkdir without -p to fail when parent is missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "no such file or directory") {
+		t.Errorf("expected 'no such file or directory' error, got: %v", err)
+	}
+
+	fullPath := filepath.Join(tempDir, dirRel)
+	if _, err := os.Stat(fullPath); !os.IsNotExist(err) {
+		t.Error("directory should not have been created")
+	}
+}
+
+func TestMkdir_WithoutParents_TargetAlreadyExists(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+
+	// 1. Target already exists as a directory
+	dirRel := "existing_dir"
+	fullPath := filepath.Join(tempDir, dirRel)
+	if err := os.Mkdir(fullPath, 0o755); err != nil {
+		t.Fatalf("failed to create existing dir: %v", err)
+	}
+
+	err := Mkdir(acc, dirRel, tempDir, false)
+	if err == nil {
+		t.Fatal("expected Mkdir without -p to fail when directory exists, got nil")
+	}
+	if !strings.Contains(err.Error(), "file exists") {
+		t.Errorf("expected 'file exists' error, got: %v", err)
+	}
+
+	// 2. Target already exists as a regular file
+	fileRel := "existing_file.txt"
+	filePath := filepath.Join(tempDir, fileRel)
+	if err := os.WriteFile(filePath, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("failed to create existing file: %v", err)
+	}
+
+	err = Mkdir(acc, fileRel, tempDir, false)
+	if err == nil {
+		t.Fatal("expected Mkdir without -p to fail when regular file exists, got nil")
+	}
+	if !strings.Contains(err.Error(), "file exists") {
+		t.Errorf("expected 'file exists' error, got: %v", err)
+	}
+}
+
+func TestMkdir_WithParents_MultiLevel(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+
+	dirRel := filepath.Join("level1", "level2", "level3")
+	if err := Mkdir(acc, dirRel, tempDir, true); err != nil {
+		t.Fatalf("Mkdir with parents failed: %v", err)
+	}
+
+	fullPath := filepath.Join(tempDir, dirRel)
+	fi, err := os.Stat(fullPath)
+	if err != nil {
+		t.Fatalf("stat multi-level directory failed: %v", err)
+	}
+	if !fi.IsDir() {
+		t.Fatalf("expected created path to be directory, got regular file")
+	}
+}
+
+func TestMkdir_WithParents_Idempotence(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+
+	// 1. Repeated creation of existing directory succeeds with nil error
+	dirRel := filepath.Join("a", "b", "c")
+	if err := Mkdir(acc, dirRel, tempDir, true); err != nil {
+		t.Fatalf("initial Mkdir failed: %v", err)
+	}
+	if err := Mkdir(acc, dirRel, tempDir, true); err != nil {
+		t.Fatalf("idempotent Mkdir failed on existing directory: %v", err)
+	}
+
+	// 2. Target exists as a regular file - must return error
+	fileRel := "a_file.txt"
+	filePath := filepath.Join(tempDir, fileRel)
+	if err := os.WriteFile(filePath, []byte("data"), 0o644); err != nil {
+		t.Fatalf("failed to create file: %v", err)
+	}
+	err := Mkdir(acc, fileRel, tempDir, true)
+	if err == nil {
+		t.Fatal("expected Mkdir with -p to fail when target is a regular file, got nil")
+	}
+	if !strings.Contains(err.Error(), "file exists") {
+		t.Errorf("expected 'file exists' error, got: %v", err)
+	}
+}
+
+func TestMkdir_AccessDenial_OutsideWriteRoot(t *testing.T) {
+	tempDir, acc, _, _, _ := helperSetupMultiRootAccess(t)
+
+	// Without parents
+	err := Mkdir(acc, "../outside/new_dir", tempDir, false)
+	if err == nil {
+		t.Fatal("expected Mkdir outside write root to fail without -p, got nil")
+	}
+	if !strings.Contains(err.Error(), "access denied") {
+		t.Errorf("expected access denied error, got: %v", err)
+	}
+
+	// With parents
+	err = Mkdir(acc, "../outside/sub/new_dir", tempDir, true)
+	if err == nil {
+		t.Fatal("expected Mkdir outside write root to fail with -p, got nil")
+	}
+	if !strings.Contains(err.Error(), "access denied") {
+		t.Errorf("expected access denied error, got: %v", err)
+	}
+}
+
+func TestMkdir_AccessDenial_ReadOnlyRoot(t *testing.T) {
+	tempDir, acc, _, readonlyDir, _ := helperSetupMultiRootAccess(t)
+
+	// Without parents
+	err := Mkdir(acc, "readonly/new_dir", tempDir, false)
+	if err == nil {
+		t.Fatal("expected Mkdir in readonly root to fail without -p, got nil")
+	}
+	if !strings.Contains(err.Error(), "access denied") {
+		t.Errorf("expected access denied error, got: %v", err)
+	}
+
+	// With parents
+	err = Mkdir(acc, "readonly/sub/new_dir", tempDir, true)
+	if err == nil {
+		t.Fatal("expected Mkdir in readonly root to fail with -p, got nil")
+	}
+	if !strings.Contains(err.Error(), "access denied") {
+		t.Errorf("expected access denied error, got: %v", err)
+	}
+
+	// Verify nothing was created in readonlyDir
+	if _, err := os.Stat(filepath.Join(readonlyDir, "new_dir")); !os.IsNotExist(err) {
+		t.Error("new_dir should not have been created in readonlyDir")
+	}
+	if _, err := os.Stat(filepath.Join(readonlyDir, "sub")); !os.IsNotExist(err) {
+		t.Error("sub should not have been created in readonlyDir")
+	}
+}
+
+func TestMkdir_AccessDenial_SymlinkEscaping(t *testing.T) {
+	tempDir, acc, writableDir, _, outsideDir := helperSetupMultiRootAccess(t)
+
+	// Create symlink inside writable pointing to outside
+	linkPath := filepath.Join(writableDir, "esc_link")
+	if err := os.Symlink(outsideDir, linkPath); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	// Without parents
+	err := Mkdir(acc, "writable/esc_link/escaped_dir", tempDir, false)
+	if err == nil {
+		t.Fatal("expected Mkdir through escaping symlink to fail without -p, got nil")
+	}
+	if !strings.Contains(err.Error(), "access denied") {
+		t.Errorf("expected access denied error, got: %v", err)
+	}
+
+	// With parents
+	err = Mkdir(acc, "writable/esc_link/sub/escaped_dir", tempDir, true)
+	if err == nil {
+		t.Fatal("expected Mkdir through escaping symlink to fail with -p, got nil")
+	}
+	if !strings.Contains(err.Error(), "access denied") {
+		t.Errorf("expected access denied error, got: %v", err)
+	}
+
+	// Verify nothing created in outsideDir
+	if _, err := os.Stat(filepath.Join(outsideDir, "escaped_dir")); !os.IsNotExist(err) {
+		t.Error("escaped_dir should not have been created in outsideDir")
+	}
+	if _, err := os.Stat(filepath.Join(outsideDir, "sub")); !os.IsNotExist(err) {
+		t.Error("sub should not have been created in outsideDir")
+	}
+}
+
+func TestMkdir_AccessDenial_IntermediateDirOutsideWriteRoot(t *testing.T) {
+	tempDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to eval symlinks: %v", err)
+	}
+
+	// Access grants only a deep subdirectory
+	accessContent := "w: deep/allowed_root\n"
+	accessFile := filepath.Join(tempDir, AccessFileName)
+	if err := os.WriteFile(accessFile, []byte(accessContent), 0o600); err != nil {
+		t.Fatalf("failed to write access file: %v", err)
+	}
+
+	acc, err := LoadAccess(tempDir)
+	if err != nil {
+		t.Fatalf("LoadAccess failed: %v", err)
+	}
+
+	// Target is inside granted root, but ancestor "deep" does not exist yet on disk.
+	// Longest existing ancestor is tempDir, which is NOT in writableRoots.
+	err = Mkdir(acc, "deep/allowed_root/sub", tempDir, true)
+	if err == nil {
+		t.Fatal("expected Mkdir with -p to fail when intermediate ancestor is outside write root, got nil")
+	}
+	if !strings.Contains(err.Error(), "access denied") {
+		t.Errorf("expected access denied error, got: %v", err)
+	}
+
+	// Verify "deep" was not created on disk
+	if _, err := os.Stat(filepath.Join(tempDir, "deep")); !os.IsNotExist(err) {
+		t.Error("ancestor directory 'deep' should not have been created")
+	}
+}
+
+func TestMkdir_AccessDenial_AccessFileName(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+
+	// Attempt to mkdir targeting FILES_RW_ACCESS itself
+	err := Mkdir(acc, AccessFileName, tempDir, false)
+	if err == nil {
+		t.Fatal("expected Mkdir on FILES_RW_ACCESS to be denied, got nil")
+	}
+	if !strings.Contains(err.Error(), "always denied") && !strings.Contains(err.Error(), "access denied") {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	err = Mkdir(acc, AccessFileName, tempDir, true)
+	if err == nil {
+		t.Fatal("expected Mkdir -p on FILES_RW_ACCESS to be denied, got nil")
+	}
+	if !strings.Contains(err.Error(), "always denied") && !strings.Contains(err.Error(), "access denied") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}

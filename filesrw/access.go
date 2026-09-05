@@ -393,6 +393,20 @@ func (a *Access) OpenFile(path, cwd string, needWrite bool, flag int, perm os.Fi
 	return f, canon, nil
 }
 
+// IsWritable reports whether canonPath is within any writable root in a,
+// and is not FILES_RW_ACCESS itself.
+func (a *Access) IsWritable(canonPath string) bool {
+	if canonPath == a.denyPath {
+		return false
+	}
+	for _, root := range a.writableRoots {
+		if withinRoot(canonPath, root) {
+			return true
+		}
+	}
+	return false
+}
+
 // Resolve validates path (relative to cwd) against a's rules and returns its
 // canonical form on success. needWrite selects which rule set (w: vs r:/w:)
 // must cover it. FILES_RW_ACCESS's own path is denied for writing/mutation.
