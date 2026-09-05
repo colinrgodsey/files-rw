@@ -398,4 +398,3 @@ func TestMkdirCmd(t *testing.T) {
 		t.Fatalf("expected mkdir --parents to succeed idempotently, got: %v", err)
 	}
 }
-

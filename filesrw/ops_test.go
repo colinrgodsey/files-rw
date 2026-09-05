@@ -1352,4 +1352,3 @@ func TestMkdir_AccessDenial_AccessFileName(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
-

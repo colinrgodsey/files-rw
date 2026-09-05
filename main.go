@@ -344,7 +344,6 @@ var mkdirCmd = &cobra.Command{
 	},
 }
 
-
 type skillInfo struct {
 	Name        string
 	Description string

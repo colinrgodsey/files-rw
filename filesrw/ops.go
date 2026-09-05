@@ -274,6 +274,7 @@ func SymlinkFile(acc *Access, linkPath, target, cwd string, force bool) error {
 //   - returns an error if the directory already exists ("file exists")
 //   - returns an error if the parent directory does not exist ("no such file or directory")
 //   - creates the directory with mode 0755
+//
 // If parents is true:
 //   - verifies that all created intermediate directories and the longest existing ancestor
 //     reside within a write-granted root in acc
@@ -340,7 +341,6 @@ func Mkdir(acc *Access, path, cwd string, parents bool) error {
 	}
 	return nil
 }
-
 
 // EditFile replaces oldStr with newStr in path after reading through an open handle.
 func EditFile(acc *Access, path, cwd string, oldStr, newStr string, replaceAll bool) error {
