@@ -201,3 +201,81 @@ func TestAccess_Resolve(t *testing.T) {
 		t.Errorf("expected escape symlink to be denied, got nil")
 	}
 }
+
+func TestAccess_SelfReadBypass(t *testing.T) {
+	tempDir, _ := filepath.EvalSymlinks(t.TempDir())
+	repoDir := filepath.Join(tempDir, "repo")
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatalf("failed to create repoDir: %v", err)
+	}
+
+	accessFile := filepath.Join(tempDir, AccessFileName)
+	// Use a subdirectory rule that does NOT cover the parent directory.
+	// This ensures FILES_RW_ACCESS is NOT in a readable root.
+	os.WriteFile(accessFile, []byte("w: repo\n"), 0o600)
+
+	acc, _ := LoadAccess(tempDir)
+
+	// 1. Verify Resolve works (due to bypass)
+	canon, err := acc.Resolve(AccessFileName, tempDir, false)
+	if err != nil {
+		t.Errorf("Resolve should allow self-read via bypass, got err: %v", err)
+	}
+	if canon != accessFile {
+		t.Errorf("expected %s, got %s", accessFile, canon)
+	}
+
+	// 2. Verify OpenFile works (due to bypass)
+	f, canon, err := acc.OpenFile(AccessFileName, tempDir, false, os.O_RDONLY, 0)
+	if err != nil {
+		t.Errorf("OpenFile should allow self-read via bypass, got err: %v", err)
+	} else {
+		f.Close()
+		if canon != accessFile {
+			t.Errorf("expected %s, got %s", accessFile, canon)
+		}
+	}
+
+	// 3. Verify Write Denial
+	_, err = acc.Resolve(AccessFileName, tempDir, true)
+	if err == nil || !strings.Contains(err.Error(), "always denied") {
+		t.Errorf("Resolve should deny self-write, got err: %v", err)
+	}
+
+	_, _, err = acc.OpenFile(AccessFileName, tempDir, true, os.O_WRONLY, 0)
+	if err == nil || !strings.Contains(err.Error(), "always denied") {
+		t.Errorf("OpenFile should deny self-write, got err: %v", err)
+	}
+}
+
+func TestAccess_SelfReadBypass_NegativeControl(t *testing.T) {
+	tempDir, _ := filepath.EvalSymlinks(t.TempDir())
+	repoDir := filepath.Join(tempDir, "repo")
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatalf("failed to create repoDir: %v", err)
+	}
+	secretDir := filepath.Join(tempDir, "secret")
+	if err := os.MkdirAll(secretDir, 0755); err != nil {
+		t.Fatalf("failed to create secretDir: %v", err)
+	}
+
+	accessFile := filepath.Join(tempDir, AccessFileName)
+	// Rule: only allows writing to 'repo'.
+	// 'secret/' is NOT covered by any rule.
+	os.WriteFile(accessFile, []byte("w: repo\n"), 0o600)
+
+	acc, _ := LoadAccess(tempDir)
+
+	// Attempt to read a file in the secret directory. 
+	// It should be denied because it's not in any rule.
+	// (We must ensure the file exists or that the access check happens BEFORE the open)
+	target := filepath.Join(secretDir, "foo")
+	os.WriteFile(target, []byte("data"), 0o600)
+
+	_, _, err := acc.OpenFile(target, tempDir, false, os.O_RDONLY, 0)
+	if err == nil {
+		t.Error("expected access denied error for uncovered directory, got nil")
+	} else if !strings.Contains(err.Error(), "access denied") {
+		t.Errorf("expected access denied error, got: %v", err)
+	}
+}
