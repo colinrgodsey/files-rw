@@ -34,6 +34,12 @@ type Access struct {
 	denyFileInfo  os.FileInfo
 }
 
+// isSelfRead returns true if the provided canonical path is the path of the
+// FILES_RW_ACCESS file itself.
+func (a *Access) isSelfRead(canonPath string) bool {
+	return canonPath == a.denyPath
+}
+
 // LoadAccess reads and parses <cwd>/FILES_RW_ACCESS. Returns an error
 // (access must be denied entirely) if the file is missing, unreadable, or
 // contains an invalid rule - there is no partial-trust fallback.
@@ -348,22 +354,30 @@ func (a *Access) OpenFile(path, cwd string, needWrite bool, flag int, perm os.Fi
 		return nil, "", err
 	}
 
-	roots := a.readableRoots
-	verb, rule := "read", "r:"
-	if needWrite {
-		roots = a.writableRoots
-		verb, rule = "write", "w:"
-	}
-
-	isAllowedRoot := false
-	for _, root := range roots {
-		if withinRoot(canon, root) {
-			isAllowedRoot = true
-			break
+	// Check for FILES_RW_ACCESS self-read bypass first.
+	if a.isSelfRead(canon) {
+		if needWrite {
+			return nil, "", fmt.Errorf("access to %s itself is always denied", AccessFileName)
 		}
-	}
-	if !isAllowedRoot {
-		return nil, "", fmt.Errorf("%s access denied for %q - not covered by any %q rule in %s", verb, path, rule, AccessFileName)
+		// If it's a read, we bypass the root check.
+	} else {
+		roots := a.readableRoots
+		verb, rule := "read", "r:"
+		if needWrite {
+			roots = a.writableRoots
+			verb, rule = "write", "w:"
+		}
+
+		isAllowedRoot := false
+		for _, root := range roots {
+			if withinRoot(canon, root) {
+				isAllowedRoot = true
+				break
+			}
+		}
+		if !isAllowedRoot {
+			return nil, "", fmt.Errorf("%s access denied for %q - not covered by any %q rule in %s", verb, path, rule, AccessFileName)
+		}
 	}
 
 	f, err := os.OpenFile(canon, flag, perm)
@@ -416,7 +430,7 @@ func (a *Access) Resolve(path, cwd string, needWrite bool) (string, error) {
 		return "", err
 	}
 
-	if canon == a.denyPath {
+	if a.isSelfRead(canon) {
 		if needWrite {
 			return "", fmt.Errorf("access to %s itself is always denied", AccessFileName)
 		}
@@ -464,7 +478,7 @@ func (a *Access) ResolveNoFollow(path, cwd string, needWrite bool) (string, erro
 	}
 	canonPath := filepath.Join(canonDir, base)
 
-	if canonPath == a.denyPath {
+	if a.isSelfRead(canonPath) {
 		if needWrite {
 			return "", fmt.Errorf("access to %s itself is always denied", AccessFileName)
 		}
@@ -562,9 +576,9 @@ func (a *Access) ResolveSymlinkCreation(linkPath, target, cwd string) (string, e
 
 // resolveSymlinkEntry determines the resolved state of a symlink for ListDir.
 // Three states:
-// (a) target missing/dangling inside a read-granted root -> "dangling"
-// (b) target outside every granted root / not reachable -> "blocked" (never the path)
-// (c) present and reachable inside a read-granted root -> canonical resolved path
+// (a) target missing/dangling inside a read-granted root -\u003e \"dangling\"
+// (b) target outside every granted root / not reachable -\u003e \"blocked\" (never the path)
+// (c) present and reachable inside a read-granted root -\u003e canonical resolved path
 func (a *Access) resolveSymlinkEntry(entryFullPath, rawTarget string) string {
 	targetAbs := rawTarget
 	if !filepath.IsAbs(targetAbs) {

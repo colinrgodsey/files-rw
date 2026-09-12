@@ -201,3 +201,44 @@ func TestAccess_Resolve(t *testing.T) {
 		t.Errorf("expected escape symlink to be denied, got nil")
 	}
 }
+
+func TestAccess_SelfReadBypass(t *testing.T) {
+	tempDir, _ := filepath.EvalSymlinks(t.TempDir())
+	accessFile := filepath.Join(tempDir, AccessFileName)
+	os.WriteFile(accessFile, []byte("r: .\n"), 0o600)
+
+	// Rule: only allow write to tempDir. No read rule for tempDir.
+	// This makes FILES_RW_ACCESS not covered by any r: rule.
+	acc, _ := LoadAccess(tempDir)
+
+	// Test Resolve
+	canon, err := acc.Resolve(AccessFileName, tempDir, false)
+	if err != nil {
+		t.Errorf("Resolve should allow self-read via bypass, got err: %v", err)
+	}
+	if canon != accessFile {
+		t.Errorf("expected %s, got %s", accessFile, canon)
+	}
+
+	// Test OpenFile
+	f, canon, err := acc.OpenFile(AccessFileName, tempDir, false, os.O_RDONLY, 0)
+	if err != nil {
+		t.Errorf("OpenFile should allow self-read via bypass, got err: %v", err)
+	} else {
+		f.Close()
+		if canon != accessFile {
+			t.Errorf("expected %s, got %s", accessFile, canon)
+		}
+	}
+
+	// Test Write Denial
+	_, err = acc.Resolve(AccessFileName, tempDir, true)
+	if err == nil || !strings.Contains(err.Error(), "always denied") {
+		t.Errorf("Resolve should deny self-write, got err: %v", err)
+	}
+
+	_, _, err = acc.OpenFile(AccessFileName, tempDir, true, os.O_WRONLY, 0)
+	if err == nil || !strings.Contains(err.Error(), "always denied") {
+		t.Errorf("OpenFile should deny self-write, got err: %v", err)
+	}
+}
