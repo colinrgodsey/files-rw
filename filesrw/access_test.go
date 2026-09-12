@@ -249,31 +249,33 @@ func TestAccess_SelfReadBypass(t *testing.T) {
 }
 
 func TestAccess_SelfReadBypass_NegativeControl(t *testing.T) {
-	// This test verifies that WITHOUT the bypass, reading FILES_RW_ACCESS 
-	// when not covered by a rule fails.
-	// To avoid complex code modification, we acknowledge that if we were to
-	// remove the bypass from OpenFile, the previous TestAccess_SelfReadBypass
-	// (with its original rule 'r: .') would pass, but the new one (with 'w: repo')
-	// would fail. 
-	
-	// As a functional negative control in the presence of the bypass:
-	// we can test a scenario where we explicitly attempt to read a path 
-	// that is NOT the access file and IS NOT covered, and ensure it fails.
-	// (This is already covered by other tests, but ensures the bypass isn't
-	// overly broad).
-
 	tempDir, _ := filepath.EvalSymlinks(t.TempDir())
+	repoDir := filepath.Join(tempDir, "repo")
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatalf("failed to create repoDir: %v", err)
+	}
 	secretDir := filepath.Join(tempDir, "secret")
-	os.MkdirAll(secretDir, 0755)
-	
+	if err := os.MkdirAll(secretDir, 0755); err != nil {
+		t.Fatalf("failed to create secretDir: %v", err)
+	}
+
 	accessFile := filepath.Join(tempDir, AccessFileName)
-	os.WriteFile(accessFile, []byte("w: .\n"), 0o600)
+	// Rule: only allows writing to 'repo'.
+	// 'secret/' is NOT covered by any rule.
+	os.WriteFile(accessFile, []byte("w: repo\n"), 0o600)
 
 	acc, _ := LoadAccess(tempDir)
 
-	// Attempt to read the secret dir. It's not in any rule.
-	_, _, err := acc.OpenFile(filepath.Join(secretDir, "foo"), tempDir, false, os.O_RDONLY, 0)
+	// Attempt to read a file in the secret directory. 
+	// It should be denied because it's not in any rule.
+	// (We must ensure the file exists or that the access check happens BEFORE the open)
+	target := filepath.Join(secretDir, "foo")
+	os.WriteFile(target, []byte("data"), 0o600)
+
+	_, _, err := acc.OpenFile(target, tempDir, false, os.O_RDONLY, 0)
 	if err == nil {
-		t.Error("expected error reading uncovered dir, got nil")
+		t.Error("expected access denied error for uncovered directory, got nil")
+	} else if !strings.Contains(err.Error(), "access denied") {
+		t.Errorf("expected access denied error, got: %v", err)
 	}
 }
