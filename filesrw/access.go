@@ -34,9 +34,9 @@ type Access struct {
 	denyFileInfo  os.FileInfo
 }
 
-// isSelfRead returns true if the provided canonical path is the path of the
+// isAccessFile returns true if the provided canonical path is the path of the
 // FILES_RW_ACCESS file itself.
-func (a *Access) isSelfRead(canonPath string) bool {
+func (a *Access) isAccessFile(canonPath string) bool {
 	return canonPath == a.denyPath
 }
 
@@ -355,7 +355,7 @@ func (a *Access) OpenFile(path, cwd string, needWrite bool, flag int, perm os.Fi
 	}
 
 	// Check for FILES_RW_ACCESS self-read bypass first.
-	if a.isSelfRead(canon) {
+	if a.isAccessFile(canon) {
 		if needWrite {
 			return nil, "", fmt.Errorf("access to %s itself is always denied", AccessFileName)
 		}
@@ -430,7 +430,7 @@ func (a *Access) Resolve(path, cwd string, needWrite bool) (string, error) {
 		return "", err
 	}
 
-	if a.isSelfRead(canon) {
+	if a.isAccessFile(canon) {
 		if needWrite {
 			return "", fmt.Errorf("access to %s itself is always denied", AccessFileName)
 		}
@@ -478,7 +478,7 @@ func (a *Access) ResolveNoFollow(path, cwd string, needWrite bool) (string, erro
 	}
 	canonPath := filepath.Join(canonDir, base)
 
-	if a.isSelfRead(canonPath) {
+	if a.isAccessFile(canonPath) {
 		if needWrite {
 			return "", fmt.Errorf("access to %s itself is always denied", AccessFileName)
 		}
