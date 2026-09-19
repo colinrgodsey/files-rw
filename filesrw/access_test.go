@@ -266,7 +266,7 @@ func TestAccess_SelfReadBypass_NegativeControl(t *testing.T) {
 
 	acc, _ := LoadAccess(tempDir)
 
-	// Attempt to read a file in the secret directory. 
+	// Attempt to read a file in the secret directory.
 	// It should be denied because it's not in any rule.
 	// (We must ensure the file exists or that the access check happens BEFORE the open)
 	target := filepath.Join(secretDir, "foo")
