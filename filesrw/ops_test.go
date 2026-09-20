@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func helperSetupAccess(t *testing.T) (string, *Access) {
@@ -223,6 +224,121 @@ func TestCopyFile(t *testing.T) {
 	}
 }
 
+// TestCopyFile_PreservesMode pins the cross-device-move regression: the copy fallback must
+// produce a destination with the SAME mode as the source, matching the inode-preserving
+// rename path. (Cross-device simulation needs tmpfs; the mode copy is factored through
+// writeFileReader's explicit mode param, which this test exercises via CopyFile.)
+func TestCopyFile_PreservesMode(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+	src := "src.txt"
+	dst := filepath.Join("sub", "dst.txt")
+	content := "mode test bytes\n"
+
+	if err := os.WriteFile(filepath.Join(tempDir, src), []byte(content), 0o640); err != nil {
+		t.Fatalf("failed to write src: %v", err)
+	}
+
+	if err := CopyFile(acc, src, dst, tempDir); err != nil {
+		t.Fatalf("CopyFile failed: %v", err)
+	}
+
+	dstInfo, err := os.Stat(filepath.Join(tempDir, dst))
+	if err != nil {
+		t.Fatalf("failed to stat dst: %v", err)
+	}
+	srcInfo, err := os.Stat(filepath.Join(tempDir, src))
+	if err != nil {
+		t.Fatalf("failed to stat src: %v", err)
+	}
+	if dstInfo.Mode().Perm() != srcInfo.Mode().Perm() {
+		t.Errorf("dst mode = %o, want %o (source mode preserved)", dstInfo.Mode().Perm(), srcInfo.Mode().Perm())
+	}
+	if dstInfo.Mode().Perm() != 0o640 {
+		t.Errorf("dst mode = %o, want 0640", dstInfo.Mode().Perm())
+	}
+}
+
+// TestWriteFileReader_ExplicitMode pins the mode-copy unit seam directly: writeFileReader
+// with an explicit mode applies it to the destination before rename.
+func TestWriteFileReader_ExplicitMode(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+	rel := filepath.Join("sub", "mode.txt")
+	if err := writeFileReader(acc, rel, tempDir, strings.NewReader("mode"), 0o600); err != nil {
+		t.Fatalf("writeFileReader failed: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(tempDir, rel))
+	if err != nil {
+		t.Fatalf("failed to stat written file: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %o, want 0600", info.Mode().Perm())
+	}
+}
+
+// TestWriteFile_HardlinkGuardBeforeRename pins the guard-ordering fix: a destination that
+// is a multi-linked file BEFORE the write must be refused outright (the old code checked
+// after rename, when the freshly installed temp file has nlink 1 by construction).
+func TestWriteFile_HardlinkGuardBeforeRename(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+	rel := "linked.txt"
+	dstPath := filepath.Join(tempDir, rel)
+
+	if err := os.WriteFile(dstPath, []byte("original"), 0o644); err != nil {
+		t.Fatalf("failed to write target: %v", err)
+	}
+	linkPath := filepath.Join(tempDir, "linked_hardlink.txt")
+	if err := os.Link(dstPath, linkPath); err != nil {
+		t.Fatalf("failed to create hardlink: %v", err)
+	}
+
+	err := WriteFile(acc, rel, tempDir, "overwrite")
+	if err == nil {
+		t.Fatalf("expected WriteFile to refuse overwriting a multi-linked destination")
+	}
+	if !strings.Contains(err.Error(), "multi-linked") {
+		t.Errorf("error should mention multi-linked, got: %v", err)
+	}
+
+	got, err := os.ReadFile(dstPath)
+	if err != nil {
+		t.Fatalf("failed to read destination after refusal: %v", err)
+	}
+	if string(got) != "original" {
+		t.Errorf("destination content = %q, want original (guard must not clobber)", string(got))
+	}
+}
+
+// TestMoveFile_RenameFastPathPreservesModeAndMtime guards the rename fast path keeps the
+// inode-mode/mtime the fallback now explicitly mirrors.
+func TestMoveFile_RenameFastPathPreservesModeAndMtime(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+	src := "msrc.txt"
+	dst := filepath.Join("sub", "mdst.txt")
+	content := "move mode bytes\n"
+
+	if err := os.WriteFile(filepath.Join(tempDir, src), []byte(content), 0o640); err != nil {
+		t.Fatalf("failed to write src: %v", err)
+	}
+	oldTime := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(filepath.Join(tempDir, src), oldTime, oldTime); err != nil {
+		t.Fatalf("failed to set old mtime: %v", err)
+	}
+
+	if err := MoveFile(acc, src, dst, tempDir); err != nil {
+		t.Fatalf("MoveFile failed: %v", err)
+	}
+
+	dstInfo, err := os.Stat(filepath.Join(tempDir, dst))
+	if err != nil {
+		t.Fatalf("failed to stat dst: %v", err)
+	}
+	if dstInfo.Mode().Perm() != 0o640 {
+		t.Errorf("dst mode = %o, want 0640 (rename preserves inode mode)", dstInfo.Mode().Perm())
+	}
+	if !dstInfo.ModTime().Equal(oldTime) {
+		t.Errorf("dst mtime = %v, want %v (rename preserves inode mtime)", dstInfo.ModTime(), oldTime)
+	}
+}
 func TestMoveFile(t *testing.T) {
 	tempDir, acc := helperSetupAccess(t)
 	src := "move_src.txt"
