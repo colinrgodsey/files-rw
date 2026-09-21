@@ -3,6 +3,7 @@ package filesrw
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -275,36 +276,96 @@ func TestWriteFileReader_ExplicitMode(t *testing.T) {
 	}
 }
 
-// TestWriteFile_HardlinkGuardBeforeRename pins the guard-ordering fix: a destination that
-// is a multi-linked file BEFORE the write must be refused outright (the old code checked
-// after rename, when the freshly installed temp file has nlink 1 by construction).
-func TestWriteFile_HardlinkGuardBeforeRename(t *testing.T) {
+// TestWriteFile_HardlinkGuard_TOCTOU pins the guard-ordering fix in the case that
+// matters: the destination becomes multi-linked AFTER Resolve validated it but
+// BEFORE the temp-file rename publishes the write. Resolve's own hardlink check
+// (access.go Resolve) only sees the pre-state, so it cannot catch this window - the
+// pre-rename guard must. The reader below creates the hardlink during io.Copy,
+// i.e. in the exact window between Resolve and the guard.
+func TestWriteFile_HardlinkGuard_TOCTOU(t *testing.T) {
 	tempDir, acc := helperSetupAccess(t)
-	rel := "linked.txt"
+	rel := "victim.txt"
 	dstPath := filepath.Join(tempDir, rel)
 
-	if err := os.WriteFile(dstPath, []byte("original"), 0o644); err != nil {
-		t.Fatalf("failed to write target: %v", err)
-	}
-	linkPath := filepath.Join(tempDir, "linked_hardlink.txt")
-	if err := os.Link(dstPath, linkPath); err != nil {
-		t.Fatalf("failed to create hardlink: %v", err)
-	}
+	// WriteFile will not have created dst yet; the destination is created and made
+	// multi-linked by the reader during the io.Copy phase, after Resolve ran.
+	content := []byte("overwrite with new content\n")
+	sent := 0
+	r := ioSectionReader(func(p []byte) (int, error) {
+		if sent == 0 {
+			// First read: fabricate the TOCTOU. Create dst and a hardlink so the file
+			// the guard is about to protect has nlink 2.
+			if err := os.WriteFile(dstPath, []byte("original"), 0o644); err != nil {
+				return 0, err
+			}
+			linkPath := filepath.Join(tempDir, "victim_link.txt")
+			if err := os.Link(dstPath, linkPath); err != nil {
+				return 0, err
+			}
+		}
+		if sent >= len(content) {
+			return 0, io.EOF
+		}
+		n := copy(p, content[sent:])
+		sent += n
+		return n, nil
+	})
 
-	err := WriteFile(acc, rel, tempDir, "overwrite")
+	err := writeFileReader(acc, rel, tempDir, r, 0)
 	if err == nil {
-		t.Fatalf("expected WriteFile to refuse overwriting a multi-linked destination")
+		t.Fatal("expected writeFileReader to refuse overwriting a destination that became multi-linked in the TOCTOU window")
 	}
 	if !strings.Contains(err.Error(), "multi-linked") {
 		t.Errorf("error should mention multi-linked, got: %v", err)
 	}
 
+	// The pre-guard content must be untouched by the refusal (no rename happened).
 	got, err := os.ReadFile(dstPath)
 	if err != nil {
 		t.Fatalf("failed to read destination after refusal: %v", err)
 	}
 	if string(got) != "original" {
 		t.Errorf("destination content = %q, want original (guard must not clobber)", string(got))
+	}
+}
+
+type sectionReader struct {
+	fn func(p []byte) (int, error)
+}
+
+func ioSectionReader(fn func(p []byte) (int, error)) io.Reader { return &sectionReader{fn: fn} }
+func (r *sectionReader) Read(p []byte) (int, error)            { return r.fn(p) }
+
+// TestHardlinkGuard_FailClosedOnLstatError pins the fail-closed branch: a destination
+// that cannot be Lstat'd (here: a path whose parent is a regular file, so Lstat
+// returns ENOTDIR rather than ENOENT) must REFUSE the write instead of silently
+// skipping the guard.
+func TestHardlinkGuard_FailClosedOnLstatError(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+	parentFile := filepath.Join(tempDir, "not_a_dir.txt")
+	if err := os.WriteFile(parentFile, []byte("x"), 0o644); err != nil {
+		t.Fatalf("failed to write parent file: %v", err)
+	}
+
+	// canonicalPath under a regular file: os.Lstat returns ENOTDIR, which is not
+	// IsNotExist - the guard must fail closed.
+	canonPath := filepath.Join(parentFile, "child.txt")
+	err := guardDestinationBeforeWrite(acc, canonPath)
+	if err == nil {
+		t.Fatal("expected guard to fail closed when the destination cannot be statted")
+	}
+	if !strings.Contains(err.Error(), "failed to stat destination before write") {
+		t.Errorf("expected fail-closed stat error, got: %v", err)
+	}
+}
+
+// TestHardlinkGuard_EmptyConflictStaysOpen pins the other branch: an ENOENT destination
+// (never written) is fine and the guard passes.
+func TestHardlinkGuard_EmptyConflictStaysOpen(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+	canonPath := filepath.Join(tempDir, "newfile.txt")
+	if err := guardDestinationBeforeWrite(acc, canonPath); err != nil {
+		t.Errorf("expected guard to pass for a non-existent destination, got: %v", err)
 	}
 }
 

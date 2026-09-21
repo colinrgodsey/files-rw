@@ -176,20 +176,38 @@ func writeFileReader(acc *Access, path, cwd string, r io.Reader, mode os.FileMod
 	// Hardlink guard BEFORE publishing: what matters is whether the destination was a
 	// multi-linked file at the moment the write replaces it. After the rename the freshly
 	// installed temp file has nlink 1 by construction, so checking post-rename could never
-	// see the guarded pre-state. An EACCES or dangling-symlink Lstat failure here is a
-	// fail-closed error, not a skipped check.
-	if info, err := os.Lstat(canonPath); err == nil {
-		if err := acc.checkHardlinkSafety(info, true); err != nil {
-			return fmt.Errorf("refusing to overwrite multi-linked file %s: %w", canonPath, err)
-		}
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("failed to stat destination before write %s: %w", canonPath, err)
+	// see the guarded pre-state.
+	if err := guardDestinationBeforeWrite(acc, canonPath); err != nil {
+		return err
 	}
 
 	if err := os.Rename(tmpPath, canonPath); err != nil {
 		return fmt.Errorf("failed to finalize write to %s: %w", canonPath, err)
 	}
 	return nil
+}
+
+// guardDestinationBeforeWrite refuses to overwrite a destination that is a multi-linked
+// file at the moment just before the temp-file rename publishes the new content, and
+// fails closed when the destination cannot be statted. It is split out from
+// writeFileReader so the TOCTOU window it guards (destination changed to a multi-link
+// AFTER Resolve validated it) is directly testable: Resolve's own hardlink check can only
+// see the destination as it was when Resolve ran.
+func guardDestinationBeforeWrite(acc *Access, canonPath string) error {
+	info, err := os.Lstat(canonPath)
+	if err == nil {
+		if err := acc.checkHardlinkSafety(info, true); err != nil {
+			return fmt.Errorf("refusing to overwrite multi-linked file %s: %w", canonPath, err)
+		}
+		return nil
+	}
+	if os.IsNotExist(err) {
+		return nil
+	}
+	// An EACCES on a parent or a dangling-symlink Lstat failure is a fail-closed error:
+	// skipping the check would silently keep the delete-by-path hazard the guard exists to
+	// prevent, so the write refuses rather than proceeding unpoliced.
+	return fmt.Errorf("failed to stat destination before write %s: %w", canonPath, err)
 }
 
 // CopyFile copies srcPath to dstPath streaming (no whole-file buffer) and preserves the
