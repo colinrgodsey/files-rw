@@ -3,10 +3,12 @@ package filesrw
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func helperSetupAccess(t *testing.T) (string, *Access) {
@@ -223,6 +225,181 @@ func TestCopyFile(t *testing.T) {
 	}
 }
 
+// TestCopyFile_PreservesMode pins the cross-device-move regression: the copy fallback must
+// produce a destination with the SAME mode as the source, matching the inode-preserving
+// rename path. (Cross-device simulation needs tmpfs; the mode copy is factored through
+// writeFileReader's explicit mode param, which this test exercises via CopyFile.)
+func TestCopyFile_PreservesMode(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+	src := "src.txt"
+	dst := filepath.Join("sub", "dst.txt")
+	content := "mode test bytes\n"
+
+	if err := os.WriteFile(filepath.Join(tempDir, src), []byte(content), 0o640); err != nil {
+		t.Fatalf("failed to write src: %v", err)
+	}
+
+	if err := CopyFile(acc, src, dst, tempDir); err != nil {
+		t.Fatalf("CopyFile failed: %v", err)
+	}
+
+	dstInfo, err := os.Stat(filepath.Join(tempDir, dst))
+	if err != nil {
+		t.Fatalf("failed to stat dst: %v", err)
+	}
+	srcInfo, err := os.Stat(filepath.Join(tempDir, src))
+	if err != nil {
+		t.Fatalf("failed to stat src: %v", err)
+	}
+	if dstInfo.Mode().Perm() != srcInfo.Mode().Perm() {
+		t.Errorf("dst mode = %o, want %o (source mode preserved)", dstInfo.Mode().Perm(), srcInfo.Mode().Perm())
+	}
+	if dstInfo.Mode().Perm() != 0o640 {
+		t.Errorf("dst mode = %o, want 0640", dstInfo.Mode().Perm())
+	}
+}
+
+// TestWriteFileReader_ExplicitMode pins the mode-copy unit seam directly: writeFileReader
+// with an explicit mode applies it to the destination before rename.
+func TestWriteFileReader_ExplicitMode(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+	rel := filepath.Join("sub", "mode.txt")
+	if err := writeFileReader(acc, rel, tempDir, strings.NewReader("mode"), 0o600); err != nil {
+		t.Fatalf("writeFileReader failed: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(tempDir, rel))
+	if err != nil {
+		t.Fatalf("failed to stat written file: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %o, want 0600", info.Mode().Perm())
+	}
+}
+
+// TestWriteFile_HardlinkGuard_TOCTOU pins the guard-ordering fix in the case that
+// matters: the destination becomes multi-linked AFTER Resolve validated it but
+// BEFORE the temp-file rename publishes the write. Resolve's own hardlink check
+// (access.go Resolve) only sees the pre-state, so it cannot catch this window - the
+// pre-rename guard must. The reader below creates the hardlink during io.Copy,
+// i.e. in the exact window between Resolve and the guard.
+func TestWriteFile_HardlinkGuard_TOCTOU(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+	rel := "victim.txt"
+	dstPath := filepath.Join(tempDir, rel)
+
+	// WriteFile will not have created dst yet; the destination is created and made
+	// multi-linked by the reader during the io.Copy phase, after Resolve ran.
+	content := []byte("overwrite with new content\n")
+	sent := 0
+	r := ioSectionReader(func(p []byte) (int, error) {
+		if sent == 0 {
+			// First read: fabricate the TOCTOU. Create dst and a hardlink so the file
+			// the guard is about to protect has nlink 2.
+			if err := os.WriteFile(dstPath, []byte("original"), 0o644); err != nil {
+				return 0, err
+			}
+			linkPath := filepath.Join(tempDir, "victim_link.txt")
+			if err := os.Link(dstPath, linkPath); err != nil {
+				return 0, err
+			}
+		}
+		if sent >= len(content) {
+			return 0, io.EOF
+		}
+		n := copy(p, content[sent:])
+		sent += n
+		return n, nil
+	})
+
+	err := writeFileReader(acc, rel, tempDir, r, 0)
+	if err == nil {
+		t.Fatal("expected writeFileReader to refuse overwriting a destination that became multi-linked in the TOCTOU window")
+	}
+	if !strings.Contains(err.Error(), "multi-linked") {
+		t.Errorf("error should mention multi-linked, got: %v", err)
+	}
+
+	// The pre-guard content must be untouched by the refusal (no rename happened).
+	got, err := os.ReadFile(dstPath)
+	if err != nil {
+		t.Fatalf("failed to read destination after refusal: %v", err)
+	}
+	if string(got) != "original" {
+		t.Errorf("destination content = %q, want original (guard must not clobber)", string(got))
+	}
+}
+
+type sectionReader struct {
+	fn func(p []byte) (int, error)
+}
+
+func ioSectionReader(fn func(p []byte) (int, error)) io.Reader { return &sectionReader{fn: fn} }
+func (r *sectionReader) Read(p []byte) (int, error)            { return r.fn(p) }
+
+// TestHardlinkGuard_FailClosedOnLstatError pins the fail-closed branch: a destination
+// that cannot be Lstat'd (here: a path whose parent is a regular file, so Lstat
+// returns ENOTDIR rather than ENOENT) must REFUSE the write instead of silently
+// skipping the guard.
+func TestHardlinkGuard_FailClosedOnLstatError(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+	parentFile := filepath.Join(tempDir, "not_a_dir.txt")
+	if err := os.WriteFile(parentFile, []byte("x"), 0o644); err != nil {
+		t.Fatalf("failed to write parent file: %v", err)
+	}
+
+	// canonicalPath under a regular file: os.Lstat returns ENOTDIR, which is not
+	// IsNotExist - the guard must fail closed.
+	canonPath := filepath.Join(parentFile, "child.txt")
+	err := guardDestinationBeforeWrite(acc, canonPath)
+	if err == nil {
+		t.Fatal("expected guard to fail closed when the destination cannot be statted")
+	}
+	if !strings.Contains(err.Error(), "failed to stat destination before write") {
+		t.Errorf("expected fail-closed stat error, got: %v", err)
+	}
+}
+
+// TestHardlinkGuard_EmptyConflictStaysOpen pins the other branch: an ENOENT destination
+// (never written) is fine and the guard passes.
+func TestHardlinkGuard_EmptyConflictStaysOpen(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+	canonPath := filepath.Join(tempDir, "newfile.txt")
+	if err := guardDestinationBeforeWrite(acc, canonPath); err != nil {
+		t.Errorf("expected guard to pass for a non-existent destination, got: %v", err)
+	}
+}
+
+// TestMoveFile_RenameFastPathPreservesModeAndMtime guards the rename fast path keeps the
+// inode-mode/mtime the fallback now explicitly mirrors.
+func TestMoveFile_RenameFastPathPreservesModeAndMtime(t *testing.T) {
+	tempDir, acc := helperSetupAccess(t)
+	src := "msrc.txt"
+	dst := filepath.Join("sub", "mdst.txt")
+	content := "move mode bytes\n"
+
+	if err := os.WriteFile(filepath.Join(tempDir, src), []byte(content), 0o640); err != nil {
+		t.Fatalf("failed to write src: %v", err)
+	}
+	oldTime := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(filepath.Join(tempDir, src), oldTime, oldTime); err != nil {
+		t.Fatalf("failed to set old mtime: %v", err)
+	}
+
+	if err := MoveFile(acc, src, dst, tempDir); err != nil {
+		t.Fatalf("MoveFile failed: %v", err)
+	}
+
+	dstInfo, err := os.Stat(filepath.Join(tempDir, dst))
+	if err != nil {
+		t.Fatalf("failed to stat dst: %v", err)
+	}
+	if dstInfo.Mode().Perm() != 0o640 {
+		t.Errorf("dst mode = %o, want 0640 (rename preserves inode mode)", dstInfo.Mode().Perm())
+	}
+	if !dstInfo.ModTime().Equal(oldTime) {
+		t.Errorf("dst mtime = %v, want %v (rename preserves inode mtime)", dstInfo.ModTime(), oldTime)
+	}
+}
 func TestMoveFile(t *testing.T) {
 	tempDir, acc := helperSetupAccess(t)
 	src := "move_src.txt"
