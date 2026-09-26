@@ -90,13 +90,27 @@ func TestReadFile(t *testing.T) {
 		t.Errorf("expected binary file error, got %v", err)
 	}
 
-	// 6. Reading FILES_RW_ACCESS itself is allowed (D24 Addendum)
-	accFileContent, err := ReadFile(acc, AccessFileName, tempDir, 0, 0, false)
+	// 6. Reading FILES_RW_ACCESS itself is allowed (D24 Addendum).
+	//
+	// Asserted against the fixture whose rules leave the access file outside every granted
+	// root. Under this test's own "w: ." rule the file is covered by that rule, so a read
+	// there succeeds on coverage whether or not the self-read bypass exists - it could not
+	// detect the bypass being removed. Pairing the read with a non-access file that no rule
+	// covers is what makes the allowance observable.
+	uncoveredDir, uncoveredAcc := helperSetupAccessUncovered(t)
+	accFileContent, err := ReadFile(uncoveredAcc, AccessFileName, uncoveredDir, 0, 0, false)
 	if err != nil {
-		t.Fatalf("expected reading %s to succeed, got %v", AccessFileName, err)
+		t.Fatalf("expected reading %s to succeed even when no rule covers it, got %v", AccessFileName, err)
 	}
-	if accFileContent != "w: .\n" {
-		t.Errorf("got %q, expected %q", accFileContent, "w: .\n")
+	if accFileContent != "w: granted\n" {
+		t.Errorf("got %q, expected %q", accFileContent, "w: granted\n")
+	}
+	if _, err := ReadFile(uncoveredAcc, "uncovered.txt", uncoveredDir, 0, 0, false); err == nil {
+		t.Error("expected the non-access file outside every root to stay denied - otherwise the read above proves nothing")
+	}
+	// And when the access file does sit inside a granted root, the read must still work.
+	if content, err := ReadFile(acc, AccessFileName, tempDir, 0, 0, false); err != nil || content != "w: .\n" {
+		t.Errorf("ACL inside a granted root: got %q, err %v", content, err)
 	}
 }
 
