@@ -134,6 +134,14 @@ func ReadFile(acc *Access, path, cwd string, start, end int, numbered bool) (str
 // creating any missing parent directories first. Atomic via write-to-temp +
 // rename, so a crash mid-write never leaves a corrupted/partial file behind.
 func WriteFile(acc *Access, path, cwd string, content string) error {
+	return writeFileReader(acc, path, cwd, strings.NewReader(content), 0)
+}
+
+// writeFileReader implements WriteFile for an arbitrary reader, optionally applying a
+// destination mode. A zero mode leaves CreateTemp's 0600 default unchanged. Shared by
+// WriteFile (string API) and CopyFile (streaming API) so both get the same temp+rename
+// atomicity and the same pre-rename hardlink guard.
+func writeFileReader(acc *Access, path, cwd string, r io.Reader, mode os.FileMode) error {
 	canonPath, err := acc.Resolve(path, cwd, true)
 	if err != nil {
 		return err
@@ -151,29 +159,59 @@ func WriteFile(acc *Access, path, cwd string, content string) error {
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath) // no-op once renamed
 
-	if _, err := tmp.WriteString(content); err != nil {
+	if _, err := io.Copy(tmp, r); err != nil {
 		tmp.Close()
 		return fmt.Errorf("failed to write %s: %w", canonPath, err)
+	}
+	if mode != 0 {
+		if err := tmp.Chmod(mode); err != nil {
+			tmp.Close()
+			return fmt.Errorf("failed to set mode %o on %s: %w", mode, canonPath, err)
+		}
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("failed to write %s: %w", canonPath, err)
 	}
 
-	if err := os.Rename(tmpPath, canonPath); err != nil {
-		return fmt.Errorf("failed to finalize write to %s: %w", canonPath, err)
+	// Hardlink guard BEFORE publishing: what matters is whether the destination was a
+	// multi-linked file at the moment the write replaces it. After the rename the freshly
+	// installed temp file has nlink 1 by construction, so checking post-rename could never
+	// see the guarded pre-state.
+	if err := guardDestinationBeforeWrite(acc, canonPath); err != nil {
+		return err
 	}
 
-	// Verify hardlink safety on finalized file
-	if info, err := os.Stat(canonPath); err == nil {
-		if err := acc.checkHardlinkSafety(info, true); err != nil {
-			_ = os.Remove(canonPath)
-			return fmt.Errorf("failed to finalize write to %s: %w", canonPath, err)
-		}
+	if err := os.Rename(tmpPath, canonPath); err != nil {
+		return fmt.Errorf("failed to finalize write to %s: %w", canonPath, err)
 	}
 	return nil
 }
 
-// CopyFile reads raw bytes from srcPath using open file handles and writes them to dstPath.
+// guardDestinationBeforeWrite refuses to overwrite a destination that is a multi-linked
+// file at the moment just before the temp-file rename publishes the new content, and
+// fails closed when the destination cannot be statted. It is split out from
+// writeFileReader so the TOCTOU window it guards (destination changed to a multi-link
+// AFTER Resolve validated it) is directly testable: Resolve's own hardlink check can only
+// see the destination as it was when Resolve ran.
+func guardDestinationBeforeWrite(acc *Access, canonPath string) error {
+	info, err := os.Lstat(canonPath)
+	if err == nil {
+		if err := acc.checkHardlinkSafety(info, true); err != nil {
+			return fmt.Errorf("refusing to overwrite multi-linked file %s: %w", canonPath, err)
+		}
+		return nil
+	}
+	if os.IsNotExist(err) {
+		return nil
+	}
+	// An EACCES on a parent or a dangling-symlink Lstat failure is a fail-closed error:
+	// skipping the check would silently keep the delete-by-path hazard the guard exists to
+	// prevent, so the write refuses rather than proceeding unpoliced.
+	return fmt.Errorf("failed to stat destination before write %s: %w", canonPath, err)
+}
+
+// CopyFile copies srcPath to dstPath streaming (no whole-file buffer) and preserves the
+// source file mode on the destination, matching the inode-preserving rename path.
 func CopyFile(acc *Access, srcPath, dstPath, cwd string) error {
 	srcFile, canonSrc, err := acc.OpenFile(srcPath, cwd, false, os.O_RDONLY, 0)
 	if err != nil {
@@ -181,12 +219,16 @@ func CopyFile(acc *Access, srcPath, dstPath, cwd string) error {
 	}
 	defer srcFile.Close()
 
-	data, err := io.ReadAll(srcFile)
+	srcInfo, err := srcFile.Stat()
 	if err != nil {
-		return fmt.Errorf("failed to read source file %s: %w", canonSrc, err)
+		return fmt.Errorf("failed to stat source file %s: %w", canonSrc, err)
 	}
+	mode := srcInfo.Mode().Perm()
 
-	return WriteFile(acc, dstPath, cwd, string(data))
+	if err := writeFileReader(acc, dstPath, cwd, srcFile, mode); err != nil {
+		return err
+	}
+	return nil
 }
 
 // MoveFile moves srcPath to dstPath using os.Rename, falling back to copy + delete
@@ -206,6 +248,10 @@ func MoveFile(acc *Access, srcPath, dstPath, cwd string) error {
 		return fmt.Errorf("failed to create parent directory %s: %w", dir, err)
 	}
 
+	// Stat before the rename so the cross-device fallback can preserve mode and mtime,
+	// keeping both move paths (inode-preserving rename vs copy+delete) observably identical.
+	srcInfo, statErr := os.Lstat(canonSrc)
+
 	err = os.Rename(canonSrc, canonDst)
 	if err == nil {
 		return nil
@@ -214,6 +260,17 @@ func MoveFile(acc *Access, srcPath, dstPath, cwd string) error {
 	// Fallback for cross-device renames or filesystem boundaries
 	if err := CopyFile(acc, srcPath, dstPath, cwd); err != nil {
 		return fmt.Errorf("failed to move %s to %s: %w", canonSrc, canonDst, err)
+	}
+	// Mode was applied by CopyFile; mtime needs explicit restore here because the fallback
+	// writes fresh content. A moved file whose mtime silently jumps to "now" is the same
+	// class of surprise as the 0600-mode bug this fixes.
+	if statErr == nil {
+		if canonDstInfo, err := os.Lstat(canonDst); err == nil {
+			_ = os.Chtimes(canonDst, canonDstInfo.ModTime(), srcInfo.ModTime())
+			// Chtimes best-effort: mtime restoration is the documented difference between
+			// cross-device and same-device moves, but a failure here must not roll back a
+			// completed move - the data and mode are already in place.
+		}
 	}
 	if err := DeleteFile(acc, srcPath, cwd); err != nil {
 		return fmt.Errorf("copied %s to %s but failed to remove original source: %w", canonSrc, canonDst, err)
@@ -420,6 +477,43 @@ type ListEntry struct {
 	ModTime  string `json:"mod_time,omitempty"`
 	Target   string `json:"target,omitempty"`
 	Resolved string `json:"resolved,omitempty"`
+	// DirPath is the display path of the directory this entry lives in, used only by the
+	// text formatter to emit recursive directory headers. Never serialized to JSON.
+	DirPath string `json:"-"`
+	// Nlink, Uid, and Gid are populated for formatLong (long listing) parity. Not serialized.
+	Nlink uint64 `json:"-"`
+	Uid   string `json:"-"`
+	Gid   string `json:"-"`
+}
+
+// formatLongEntry renders the long form from a walker entry, mirroring formatLong over the
+// same stat-derived fields captured during the walk.
+func formatLongEntry(e ListEntry) string {
+	nlink := uint64(1)
+	userName := "user"
+	groupName := "group"
+	if e.Nlink != 0 {
+		nlink = e.Nlink
+	}
+	if e.Uid != "" {
+		userName = e.Uid
+	}
+	if e.Gid != "" {
+		groupName = e.Gid
+	}
+	displayName := e.Name
+	if e.Target != "" {
+		displayName = e.Name + " -> " + e.Target
+	}
+	return fmt.Sprintf("%s %d %s %s %8d %s %s\n",
+		e.Mode,
+		nlink,
+		userName,
+		groupName,
+		e.Size,
+		e.ModTime,
+		displayName,
+	)
 }
 
 func formatLong(fi os.FileInfo, name, target string) string {
@@ -453,86 +547,26 @@ func formatLong(fi os.FileInfo, name, target string) string {
 	)
 }
 
-func walkDirJSON(acc *Access, dirPath, relPrefix string, all, recursive bool, entries *[]ListEntry) error {
-	dirEntries, err := os.ReadDir(dirPath)
-	if err != nil {
-		return fmt.Errorf("failed to read directory %s: %w", dirPath, err)
-	}
-
-	for _, de := range dirEntries {
-		name := de.Name()
-		if !all && strings.HasPrefix(name, ".") {
-			continue
-		}
-
-		fullPath := filepath.Join(dirPath, name)
-		relPath := name
-		if relPrefix != "" {
-			relPath = filepath.Join(relPrefix, name)
-		}
-
-		fi, err := os.Lstat(fullPath)
-		if err != nil {
-			return fmt.Errorf("failed to stat %s: %w", fullPath, err)
-		}
-
-		entry := ListEntry{
-			Name:    name,
-			Path:    relPath,
-			Size:    fi.Size(),
-			Mode:    fi.Mode().String(),
-			ModTime: fi.ModTime().Format("Jan _2 15:04"),
-		}
-
-		switch {
-		case fi.Mode()&os.ModeSymlink != 0:
-			entry.Type = "symlink"
-			rawTarget, err := os.Readlink(fullPath)
-			if err == nil {
-				entry.Target = rawTarget
-				entry.Resolved = acc.resolveSymlinkEntry(fullPath, rawTarget)
-			}
-		case fi.IsDir():
-			entry.Type = "dir"
-		case fi.Mode().IsRegular():
-			entry.Type = "file"
-		default:
-			entry.Type = "other"
-		}
-
-		*entries = append(*entries, entry)
-
-		if recursive && fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
-			if err := walkDirJSON(acc, fullPath, relPath, all, recursive, entries); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func walkDirText(acc *Access, dirPath, displayPath string, long, all, recursive bool) (string, error) {
-	var b strings.Builder
-
+// walkDirEntries is the single directory traversal for ListDir. It walks readdir order
+// using an explicit task queue (BFS), applying the five listing rules exactly once:
+// skip dotfiles unless all; join child paths; Lstat for metadata; readlink for display;
+// and recurse only into real directories (fi.IsDir() and not ModeSymlink) so a recursive
+// listing never follows a symlink out of the allowlisted root.
+func walkDirEntries(acc *Access, rootPath, rootDisplay string, all, recursive bool, emit func(ListEntry), visitDir ...func(displayPath string, isRoot bool)) error {
 	type dirTask struct {
 		absPath     string
 		displayPath string
 	}
-
-	tasks := []dirTask{{absPath: dirPath, displayPath: displayPath}}
+	tasks := []dirTask{{absPath: rootPath, displayPath: rootDisplay}}
 
 	for taskIdx := 0; taskIdx < len(tasks); taskIdx++ {
 		cur := tasks[taskIdx]
+		if len(visitDir) > 0 {
+			visitDir[0](cur.displayPath, taskIdx == 0)
+		}
 		dirEntries, err := os.ReadDir(cur.absPath)
 		if err != nil {
-			return "", fmt.Errorf("failed to read directory %s: %w", cur.absPath, err)
-		}
-
-		if recursive {
-			if taskIdx > 0 {
-				b.WriteString("\n")
-			}
-			fmt.Fprintf(&b, "%s:\n", cur.displayPath)
+			return fmt.Errorf("failed to read directory %s: %w", cur.absPath, err)
 		}
 
 		var subdirs []dirTask
@@ -543,30 +577,61 @@ func walkDirText(acc *Access, dirPath, displayPath string, long, all, recursive 
 			}
 
 			fullPath := filepath.Join(cur.absPath, name)
+			relPath := name
+			if cur.displayPath != "" {
+				relPath = filepath.Join(cur.displayPath, name)
+			}
+
 			fi, err := os.Lstat(fullPath)
 			if err != nil {
-				return "", fmt.Errorf("failed to stat %s: %w", fullPath, err)
+				return fmt.Errorf("failed to stat %s: %w", fullPath, err)
 			}
 
-			target := ""
-			if fi.Mode()&os.ModeSymlink != 0 {
-				if t, err := os.Readlink(fullPath); err == nil {
-					target = t
-				}
+			entry := ListEntry{
+				Name:    name,
+				Path:    relPath,
+				Size:    fi.Size(),
+				Mode:    fi.Mode().String(),
+				ModTime: fi.ModTime().Format("Jan _2 15:04"),
+				DirPath: cur.displayPath,
 			}
-
-			if long {
-				b.WriteString(formatLong(fi, name, target))
-			} else {
-				if target != "" {
-					fmt.Fprintf(&b, "%s -> %s\n", name, target)
+			if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+				entry.Nlink = uint64(stat.Nlink)
+				if u, err := user.LookupId(strconv.FormatUint(uint64(stat.Uid), 10)); err == nil && u.Username != "" {
+					entry.Uid = u.Username
 				} else {
-					fmt.Fprintf(&b, "%s\n", name)
+					entry.Uid = strconv.FormatUint(uint64(stat.Uid), 10)
+				}
+				if g, err := user.LookupGroupId(strconv.FormatUint(uint64(stat.Gid), 10)); err == nil && g.Name != "" {
+					entry.Gid = g.Name
+				} else {
+					entry.Gid = strconv.FormatUint(uint64(stat.Gid), 10)
 				}
 			}
+
+			switch {
+			case fi.Mode()&os.ModeSymlink != 0:
+				entry.Type = "symlink"
+				rawTarget, err := os.Readlink(fullPath)
+				if err == nil {
+					entry.Target = rawTarget
+					entry.Resolved = acc.resolveSymlinkEntry(fullPath, rawTarget)
+				}
+			case fi.IsDir():
+				entry.Type = "dir"
+			case fi.Mode().IsRegular():
+				entry.Type = "file"
+			default:
+				entry.Type = "other"
+			}
+
+			emit(entry)
 
 			if recursive && fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
-				subDisplay := filepath.Join(cur.displayPath, name)
+				subDisplay := name
+				if cur.displayPath != "" {
+					subDisplay = filepath.Join(cur.displayPath, name)
+				}
 				subdirs = append(subdirs, dirTask{absPath: fullPath, displayPath: subDisplay})
 			}
 		}
@@ -575,7 +640,48 @@ func walkDirText(acc *Access, dirPath, displayPath string, long, all, recursive 
 			tasks = append(tasks, subdirs...)
 		}
 	}
+	return nil
+}
 
+func walkDirJSON(acc *Access, rootPath, rootDisplay string, all, recursive bool, entries *[]ListEntry) error {
+	return walkDirEntries(acc, rootPath, rootDisplay, all, recursive, func(e ListEntry) {
+		*entries = append(*entries, e)
+	})
+}
+
+// walkDirText renders a listing from the shared walker. Long form reuses formatLong; the
+// short form prints bare names (with symlink target) like a plain `ls`. Recursive mode
+// emits one directory header block per directory, in BFS visit order, including headers
+// for empty directories.
+func walkDirText(acc *Access, rootPath, rootDisplay string, long, all, recursive bool) (string, error) {
+	var b strings.Builder
+	sawRootHeader := false
+	visit := func(displayPath string, isRoot bool) {
+		if !recursive {
+			return
+		}
+		if !sawRootHeader {
+			fmt.Fprintf(&b, "%s:\n", displayPath)
+			sawRootHeader = true
+			return
+		}
+		b.WriteString("\n")
+		fmt.Fprintf(&b, "%s:\n", displayPath)
+	}
+	err := walkDirEntries(acc, rootPath, rootDisplay, all, recursive, func(e ListEntry) {
+		if long {
+			b.WriteString(formatLongEntry(e))
+		} else {
+			if e.Target != "" {
+				fmt.Fprintf(&b, "%s -> %s\n", e.Name, e.Target)
+			} else {
+				fmt.Fprintf(&b, "%s\n", e.Name)
+			}
+		}
+	}, visit)
+	if err != nil {
+		return "", err
+	}
 	return b.String(), nil
 }
 

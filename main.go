@@ -339,7 +339,10 @@ var mkdirCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		parents, _ := cmd.Flags().GetBool("parents")
+		parents, err := cmd.Flags().GetBool("parents")
+		if err != nil {
+			return fmt.Errorf("read --parents flag: %w", err)
+		}
 		return filesrw.Mkdir(access, args[0], cwd, parents)
 	},
 }
