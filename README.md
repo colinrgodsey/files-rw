@@ -17,16 +17,30 @@ w: output
 - Paths are relative to `FILES_RW_ACCESS`'s own directory, resolved to canonical absolute paths (symlinks included) so containment checks can't be fooled by a symlink or hardlink pointing outside the granted roots.
 - `FILES_RW_ACCESS` can never be written to via `files-rw`, regardless of what rules it grants - only read.
 
-Run `files-rw access` from inside a directory to see exactly what it currently grants, rather than guessing from `read`/`write` error messages.
-
 ## Commands
 
 `read`, `write`, `edit`, `patch`, `copy`, `move`, `delete`, `list`, `tail`, `append`, `access` - each documented via `files-rw <command> --help`. There's no separate directory-creation command: `write` and `append` both create missing parent directories as a side effect.
 
-## Build
+## Install
+
+Requires Go 1.21+ (no CGO). Install the latest release directly:
+
+```bash
+go install github.com/colinrgodsey/files-rw@latest
+```
+
+The binary lands in `$(go env GOPATH)/bin/files-rw` (usually `~/go/bin/files-rw`); make sure that directory is on your `PATH`.
+
+To pin to a specific checkout instead, build from the source tree:
 
 ```bash
 go build -o files-rw .
+```
+
+Verify the install with a one-line smoke test:
+
+```bash
+files-rw --help
 ```
 
 ## Origin and security testing
