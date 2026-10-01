@@ -5,6 +5,7 @@ package filesrw
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,9 +41,32 @@ func (a *Access) isAccessFile(canonPath string) bool {
 	return canonPath == a.denyPath
 }
 
-// LoadAccess reads and parses <cwd>/FILES_RW_ACCESS. Returns an error
-// (access must be denied entirely) if the file is missing, unreadable, or
-// contains an invalid rule - there is no partial-trust fallback.
+// warnIgnoredRule reports one unusable FILES_RW_ACCESS rule and states the
+// consequence, so a partially applied ACL is never mistaken for the intended one.
+// warnPendingRule reports a well-formed grant whose path is not on disk yet. It is kept
+// and will apply as soon as the path appears, but a typo and a not-yet-created file look
+// identical in a grant list, so the operator hears about it either way.
+func warnPendingRule(lineNo int, line string) {
+	fmt.Fprintf(accessWarnings, "warning: %s line %d (%q): path does not exist yet - grant kept and will apply once it exists, check the spelling if that is not what you meant\n", AccessFileName, lineNo, line)
+}
+
+func warnIgnoredRule(lineNo int, line, reason string) {
+	fmt.Fprintf(accessWarnings, "warning: %s line %d (%q): %s - rule ignored, remaining rules still apply\n", AccessFileName, lineNo, line, reason)
+}
+
+// accessWarnings receives per-rule problems found while reading FILES_RW_ACCESS.
+// A broken line must not take the rest of the ACL down with it, so these are reported
+// rather than returned, and the loader runs once per invocation, so an operator sees
+// the warning every time instead of once at setup. It is a variable so a test can
+// assert the exact text an operator would get.
+var accessWarnings io.Writer = os.Stderr
+
+// LoadAccess reads and parses <cwd>/FILES_RW_ACCESS. Only a whole-file problem
+// denies access: a missing, unreadable, or partially unreadable file yields an
+// error and no grants. Individual rules are independent. A rule that cannot be
+// used, because it is malformed or its path cannot be resolved, is reported on
+// accessWarnings and skipped, never fatal, so one typo cannot revoke the grants
+// of every other line in the file.
 func LoadAccess(cwd string) (*Access, error) {
 	accessFilePath := filepath.Join(cwd, AccessFileName)
 
@@ -89,15 +113,26 @@ func LoadAccess(cwd string) (*Access, error) {
 			writable = false
 			rest = strings.TrimSpace(line[len(rulePrefixRead):])
 		default:
-			return nil, fmt.Errorf("%s line %d: invalid rule %q - must start with %q or %q", AccessFileName, lineNo, line, rulePrefixWrite, rulePrefixRead)
+			warnIgnoredRule(lineNo, line, fmt.Sprintf("invalid rule %q - must start with %q or %q", line, rulePrefixWrite, rulePrefixRead))
+			continue
 		}
 		if rest == "" {
-			return nil, fmt.Errorf("%s line %d: rule has no path", AccessFileName, lineNo)
+			warnIgnoredRule(lineNo, line, "rule has no path")
+			continue
 		}
 
-		root, err := canonicalizeRoot(rest, cwd, writable)
+		// A path that does not exist yet is a valid grant, not a configuration error:
+		// declaring write access to a file the agent intends to create is the normal
+		// case. Whatever exists on disk is symlink-resolved and the missing tail is kept
+		// literally, so the root compares equal to the operation target once the path
+		// appears. A read root for a missing path is inert for the same reason.
+		root, err := canonicalizeTarget(rest, cwd)
 		if err != nil {
-			return nil, fmt.Errorf("%s line %d: %w", AccessFileName, lineNo, err)
+			warnIgnoredRule(lineNo, line, err.Error())
+			continue
+		}
+		if _, statErr := os.Stat(root); statErr != nil && os.IsNotExist(statErr) {
+			warnPendingRule(lineNo, line)
 		}
 
 		acc.readableRoots = append(acc.readableRoots, root)
@@ -224,27 +259,6 @@ func evalSymlinksHops(path string, maxHops int) (string, int, bool, error) {
 	}
 
 	return filepath.Clean(current), hops, false, nil
-}
-
-// canonicalizeRoot resolves a FILES_RW_ACCESS rule's path to a canonical
-// absolute path. A r: root must exist; a w: root may not exist yet, in which case
-// its existing ancestor directory is canonicalized.
-func canonicalizeRoot(path, cwd string, writable bool) (string, error) {
-	if strings.Contains(path, tildeChar) {
-		return "", fmt.Errorf("path %q contains %q - not supported, use an absolute path", path, tildeChar)
-	}
-	if writable {
-		return canonicalizeTarget(path, cwd)
-	}
-	abs := path
-	if !filepath.IsAbs(abs) {
-		abs = filepath.Join(cwd, abs)
-	}
-	resolved, _, _, err := evalSymlinksHops(abs, MaxSymlinkHops)
-	if err != nil {
-		return "", fmt.Errorf("failed to resolve %q: %w", path, err)
-	}
-	return resolved, nil
 }
 
 // canonicalizeTarget resolves a request path (possibly relative to cwd) to

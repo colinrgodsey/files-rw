@@ -18,57 +18,6 @@ func TestLoadAccess_MissingFile(t *testing.T) {
 	}
 }
 
-func TestLoadAccess_InvalidRules(t *testing.T) {
-	tests := []struct {
-		name    string
-		content string
-		wantErr string
-	}{
-		{
-			name:    "invalid prefix",
-			content: "x: /tmp\n",
-			wantErr: "invalid rule",
-		},
-		{
-			name:    "no path",
-			content: "w:\n",
-			wantErr: "rule has no path",
-		},
-		{
-			name:    "contains tilde",
-			content: "w: ~/foo\n",
-			wantErr: "contains \"~\"",
-		},
-		{
-			name:    "nonexistent root",
-			content: "r: /nonexistent_path_wackypub_test_dir_12345\n",
-			wantErr: "failed to resolve",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tempDir := t.TempDir()
-			accessFile := filepath.Join(tempDir, AccessFileName)
-			if err := os.WriteFile(accessFile, []byte(tt.content), 0o600); err != nil {
-				t.Fatalf("failed to create access file: %v", err)
-			}
-			_, err := LoadAccess(tempDir)
-			if err == nil {
-				t.Fatalf("expected error containing %q, got nil", tt.wantErr)
-			}
-			if !strings.Contains(err.Error(), tt.wantErr) {
-				t.Errorf("error %q does not contain %q", err.Error(), tt.wantErr)
-			}
-		})
-	}
-}
-
-// TestLoadAccess_WritableRootNeedNotExist is a regression test for a bug
-// found live: a w: rule pointing at a directory that doesn't exist yet used
-// to fail at LoadAccess time, making write's auto-mkdir-within-writable-root
-// behavior unreachable for any brand-new output directory (the exact case
-// it exists for). r: keeps the strict must-exist check.
 func TestLoadAccess_WritableRootNeedNotExist(t *testing.T) {
 	tempDir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
