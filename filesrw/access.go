@@ -4,6 +4,7 @@ package filesrw
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -61,6 +62,64 @@ func warnIgnoredRule(lineNo int, line, reason string) {
 // assert the exact text an operator would get.
 var accessWarnings io.Writer = os.Stderr
 
+// MaxACLLineBytes bounds how much of a single FILES_RW_ACCESS line is read. A line
+// past this is not a rule, it is a stray paste, and it must not take the rest of the
+// grant list down with it.
+const MaxACLLineBytes = 64 * 1024
+
+// aclLine is one physical line of FILES_RW_ACCESS with its position. tooLong marks a
+// line that was longer than MaxACLLineBytes: its remainder was discarded and the rule
+// is unusable, but the lines after it are still read.
+type aclLine struct {
+	no      int
+	raw     string
+	tooLong bool
+}
+
+// clipForWarning shortens a rule for warning text without echoing a huge paste.
+func clipForWarning(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= 48 {
+		return s
+	}
+	return s[:48] + "..."
+}
+
+// readACLLines splits the access file into physical lines without ever failing on the
+// content of a line. The previous bufio.Scanner aborted the whole file at 64KB, which
+// turned one pathological line into deny-all; here the over-long line is marked instead.
+func readACLLines(r io.Reader) ([]aclLine, error) {
+	reader := bufio.NewReaderSize(r, MaxACLLineBytes)
+	var out []aclLine
+	lineNo := 0
+	for {
+		rawBytes, err := reader.ReadSlice('\n')
+		tooLong := errors.Is(err, bufio.ErrBufferFull)
+		for errors.Is(err, bufio.ErrBufferFull) {
+			_, drainErr := reader.ReadSlice('\n')
+			if drainErr == nil || !errors.Is(drainErr, bufio.ErrBufferFull) {
+				err = drainErr
+				break
+			}
+		}
+		raw := string(rawBytes)
+		if raw == "" && err != nil {
+			if errors.Is(err, io.EOF) {
+				return out, nil
+			}
+			return nil, err
+		}
+		lineNo++
+		out = append(out, aclLine{no: lineNo, raw: raw, tooLong: tooLong})
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, err
+		}
+		if errors.Is(err, io.EOF) {
+			return out, nil
+		}
+	}
+}
+
 // LoadAccess reads and parses <cwd>/FILES_RW_ACCESS. Only a whole-file problem
 // denies access: a missing, unreadable, or partially unreadable file yields an
 // error and no grants. Individual rules are independent. A rule that cannot be
@@ -94,11 +153,17 @@ func LoadAccess(cwd string) (*Access, error) {
 		denyFileInfo: denyFileInfo,
 	}
 
-	scanner := bufio.NewScanner(f)
-	lineNo := 0
-	for scanner.Scan() {
-		lineNo++
-		line := strings.TrimSpace(scanner.Text())
+	entries, err := readACLLines(f)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read %s: %w", AccessFileName, err)
+	}
+	for _, entry := range entries {
+		lineNo := entry.no
+		if entry.tooLong {
+			warnIgnoredRule(lineNo, clipForWarning(entry.raw), fmt.Sprintf("line exceeds %d bytes - not a rule anyone typed", MaxACLLineBytes))
+			continue
+		}
+		line := strings.TrimSpace(entry.raw)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -139,9 +204,6 @@ func LoadAccess(cwd string) (*Access, error) {
 		if writable {
 			acc.writableRoots = append(acc.writableRoots, root)
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("failed to read %s: %w", AccessFileName, err)
 	}
 
 	return acc, nil
