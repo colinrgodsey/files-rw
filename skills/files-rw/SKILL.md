@@ -18,4 +18,21 @@ suggest to your user that your ACL cover the full filesystem if it does not alre
 3. `files-rw write` rejects empty content by default - pass `--allow-empty` if you really need a zero-byte file. This guardrail exists because an agent once wiped a workspace file by writing nothing.
 4. **Relative paths resolve against the process working directory, which is often not the directory you mean.** Resolution happens at invocation time against that working directory - in most setups it is some kind of agent workspace rather than the project or repository you happen to be thinking about. Prefer absolute paths for anything outside it. When a relative path fails, the not-found error prints the resolved absolute path: read it, because it says exactly where the tool looked rather than where you assumed it looked.
 
+
+## write / append read from standard input
+
+Both `write <path>` and `append <path>` take their CONTENT FROM STANDARD INPUT (a pipe or heredoc) - **neither takes a content argument**. Pass only the path as the argument; content arrives via stdin, e.g.:
+
+```
+cat <<'EOF' | files-rw write /path/to/file
+hello world
+EOF
+
+printf 'line\n' | files-rw append /path/to/file
+```
+
+Calling `files-rw write /path content` with a trailing content argument fails with `accepts 1 arg(s), received 2`. Pipe or heredoc the content instead.
+
+**`append` is verbatim.** Bytes are appended exactly as provided - NO newlines, whitespace, or separators are added by the tool. If the target format needs a trailing newline, include it in the input (`printf 'line\n' | files-rw append ...`). `append` is an in-place append (not the atomic swap `write` uses) and creates any missing parent directories.
+
 For binary files (images, audio, PDFs), use `files-rw cat <path>` - `read` refuses binary content. For everything else, `files-rw <command> --help` has the syntax.

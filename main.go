@@ -306,7 +306,7 @@ var tailCmd = &cobra.Command{
 var appendCmd = &cobra.Command{
 	Use:   "append <path>",
 	Short: "Append content from standard input to a file",
-	Long:  "Append content provided on standard input directly to the target path, creating any missing parent directories. Note: unlike 'write', 'append' performs an in-place append rather than an atomic file swap.",
+	Long:  "Append standard input verbatim to the target path, creating any missing parent directories. No newlines or whitespace are added - the bytes are appended exactly as provided; include a trailing newline in the input if the format needs one. Note: unlike 'write', 'append' performs an in-place append rather than an atomic file swap.",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cwd, err := os.Getwd()
