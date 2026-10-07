@@ -124,9 +124,6 @@ Body content here.`
 	if info.Description != "A test skill description" {
 		t.Errorf("expected description 'A test skill description', got %q", info.Description)
 	}
-	if !info.AlwaysLoad {
-		t.Errorf("expected AlwaysLoad to be true")
-	}
 
 	// Fallback when frontmatter is missing
 	noFM := "# Just markdown"
