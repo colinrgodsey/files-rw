@@ -1063,6 +1063,16 @@ func TestSymlink_ForceOverwrite(t *testing.T) {
 	if target != "second.txt" {
 		t.Errorf("target should now be second.txt, got %q", target)
 	}
+
+	// 4. With force against an existing directory, overwrite is rejected
+	dirRel := "writable/sub_dir"
+	if err := os.MkdirAll(filepath.Join(writableDir, "sub_dir"), 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	err = SymlinkFile(acc, dirRel, "second.txt", tempDir, true)
+	if err == nil || !strings.Contains(err.Error(), "cannot overwrite directory") {
+		t.Errorf("expected cannot overwrite directory error, got: %v", err)
+	}
 }
 
 // (j) non-JSON output shows the `-> target` suffix

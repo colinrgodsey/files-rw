@@ -241,7 +241,7 @@ var listCmd = &cobra.Command{
 var symlinkCmd = &cobra.Command{
 	Use:   "symlink <link> <target>",
 	Short: "Create a symlink pointing to target",
-	Long:  "Create a symlink at <link> pointing to <target>. Target is stored verbatim (relative stays relative). Use --force to overwrite an existing link.",
+	Long:  "Create a symlink at <link> pointing to <target>. Target is stored verbatim (relative stays relative). Use --force to overwrite an existing link or regular file (directories are never overwritten).",
 	Args:  cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cwd, err := os.Getwd()
@@ -350,7 +350,6 @@ var mkdirCmd = &cobra.Command{
 type skillInfo struct {
 	Name        string
 	Description string
-	AlwaysLoad  bool
 }
 
 type bundledSkill struct {
@@ -386,8 +385,6 @@ func parseSkillContent(content string, fallbackName string) (*skillInfo, error) 
 						if v != "" {
 							info.Description = v
 						}
-					case "always_load":
-						info.AlwaysLoad = (v == "true")
 					}
 				}
 			}
@@ -469,7 +466,7 @@ func init() {
 	listCmd.Flags().BoolVarP(&listRecursive, "recursive", "R", false, "list subdirectories recursively")
 	listCmd.Flags().BoolVar(&listJSON, "json", false, "output in JSON format")
 
-	symlinkCmd.Flags().BoolVarP(&symlinkForce, "force", "f", false, "overwrite an existing link")
+	symlinkCmd.Flags().BoolVarP(&symlinkForce, "force", "f", false, "overwrite an existing link or regular file (directories are never overwritten)")
 
 	writeCmd.Flags().BoolVar(&writeAllowEmpty, "allow-empty", false, "Allow writing empty (zero-byte) content from stdin")
 

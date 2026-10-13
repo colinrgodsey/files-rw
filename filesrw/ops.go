@@ -293,7 +293,7 @@ func DeleteFile(acc *Access, path, cwd string) error {
 
 // SymlinkFile creates a symlink at linkPath pointing to target.
 // Target is stored verbatim (relative stays relative).
-// If force is true, overwrites an existing link or file.
+// If force is true, overwrites an existing link or regular file (directories are never overwritten).
 func SymlinkFile(acc *Access, linkPath, target, cwd string, force bool) error {
 	canonLink, err := acc.ResolveSymlinkCreation(linkPath, target, cwd)
 	if err != nil {
